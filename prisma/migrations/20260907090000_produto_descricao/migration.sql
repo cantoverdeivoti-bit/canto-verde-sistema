@@ -1,0 +1,11 @@
+-- Detalhe do produto: o que não cabe no nome.
+--
+-- A grade de produtos mostra o nome numa coluna estreita, e é por ele que a
+-- busca procura. O que sobrava — marca preferida, calibre, o corte exato,
+-- "não aceitar da marca X" — não tinha onde morar, e acabava espremido dentro
+-- do próprio nome, atrapalhando a busca e a leitura da lista.
+--
+-- Nulo de propósito, e sem default: produto sem detalhe é o caso normal, não
+-- um campo por preencher. String vazia vira NULL na validação (optionalText),
+-- então não há dois jeitos de dizer "não tem".
+ALTER TABLE "products" ADD COLUMN "description" TEXT;

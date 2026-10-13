@@ -1,0 +1,64 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# prisma client gerado (recriado por `prisma generate` no build)
+/generated
+VERCEL-VARIAVEIS.txt
+
+# Skills de trabalho, não do sistema. A padrao-das-telas é versionada de
+# propósito (o CLAUDE.md a carrega em toda conversa); as demais são ferramenta
+# pessoal e entram aqui uma a uma, para não esconder por engano uma que importe.
+/.claude/skills/impeccable/
+/.claude/skills/grill-me/
+/.agents/skills/grill-me/
+
+# Estado da sessão do Impeccable ao vivo: PID, porta e token do servidor de
+# sobreposição. É de máquina, não de projeto. A crítica em .impeccable/critique
+# fica versionada de propósito — é o backlog de design que o /polish lê.
+/.impeccable/live/
+
+# Cópias que o Google Drive cria em conflito de sincronização ("arquivo (1).tsx").
+* (1).*
+
+# Fotos do scripts/capturas.mjs: conferência local, não vão para o git.
+/capturas/

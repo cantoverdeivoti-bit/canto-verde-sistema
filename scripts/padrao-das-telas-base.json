@@ -1,0 +1,43 @@
+{
+  "confirm": {},
+  "travessao": {
+    "app/admin/comercial/avisos/notifications-form.tsx": 1,
+    "app/admin/comercial/avisos/secao.tsx": 1,
+    "app/admin/comercial/capacidade/special-dates.tsx": 1,
+    "app/admin/comercial/new-reservation.tsx": 1,
+    "app/admin/comercial/page.tsx": 1,
+    "app/admin/comercial/regras/rules-form.tsx": 2,
+    "app/admin/compras/conferir/page.tsx": 4,
+    "app/admin/compras/conferir/pesquisa.tsx": 1,
+    "app/admin/compras/conferir/revisar-lista.tsx": 8,
+    "app/admin/compras/contagem/iniciar-form.tsx": 3,
+    "app/admin/compras/cotacao/[id]/comparativo.tsx": 5,
+    "app/admin/compras/cotacao/[id]/respostas-pesquisa.tsx": 1,
+    "app/admin/compras/enviar/page.tsx": 2,
+    "app/admin/compras/fornecedores/suppliers-list.tsx": 4,
+    "app/admin/compras/pendencias/pendencias.tsx": 1,
+    "app/admin/compras/products-list.tsx": 2,
+    "app/admin/tarefas/[projeto]/membros/membros-lista.tsx": 1,
+    "app/admin/tarefas/[projeto]/membros/page.tsx": 1,
+    "app/admin/tarefas/[projeto]/quadro.tsx": 1,
+    "app/admin/tarefas/lista/lista-tarefas.tsx": 1,
+    "app/admin/tarefas/matriz/matriz.tsx": 1,
+    "app/admin/tarefas/page.tsx": 2,
+    "app/admin/tarefas/t/[id]/detalhe.tsx": 2,
+    "app/comprador/cotacao/[token]/pesquisa-form.tsx": 2,
+    "app/comprador/cotacao/[token]/preco-form.tsx": 1,
+    "app/estoquista/contagem/[token]/contagem-form.tsx": 5
+  },
+  "acoes": {
+    "app/admin/comercial/page.tsx": 1,
+    "app/admin/eventos/orcamentos/page.tsx": 1,
+    "app/admin/eventos/page.tsx": 1,
+    "app/admin/eventos/receitas/page.tsx": 1,
+    "app/admin/financeiro/dre/page.tsx": 1,
+    "app/admin/financeiro/page.tsx": 2,
+    "app/admin/operacional/page.tsx": 1,
+    "app/admin/operacional/processos/page.tsx": 1,
+    "app/admin/pessoal/colaboradores/page.tsx": 1,
+    "app/admin/pessoal/escala-da-semana.tsx": 1
+  }
+}

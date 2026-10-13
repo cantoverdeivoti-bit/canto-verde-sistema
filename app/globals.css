@@ -1,0 +1,811 @@
+@import "tailwindcss";
+@import "shadcn/tailwind.css";
+/*
+  ---break---
+*/
+
+/*
+  A paleta da casa: verde-mata, trigo, branco e terra. Um tema só, claro.
+
+  Os NOMES são a convenção do shadcn (primary, muted, ring…), para os
+  componentes da base caírem vestidos; os VALORES são os da casa. Uma
+  regra manda em tudo: o dourado #eab142 dá 1.93:1 sobre branco —
+  inutilizável como texto. Quem exerce o papel dele é o ocre --ring/--warn,
+  o mesmo dourado escurecido até passar em AA.
+
+  Atenção à tradução de dialeto: no shadcn "muted" é FUNDO e
+  "muted-foreground" é o texto de apoio; "accent" é fundo de hover, não o
+  vinho — o vinho é "primary". O código da casa já fala este dialeto.
+*/
+:root {
+  /* Controles nativos claros: campo de data, seleção, barra de rolagem. */
+  color-scheme: light;
+
+  --background: #ffffff;
+  /* 18.79:1 — o preto da marca. */
+  --foreground: #0e1217;
+
+  /* 9.6:1 — o verde-mata do Canto Verde, um passo aberto do preto do texto. */
+  --primary: #2f4a2b;
+  --primary-foreground: #faf8f5;
+
+  --card: #faf8f5;
+  --card-foreground: #0e1217;
+  --popover: #ffffff;
+  --popover-foreground: #0e1217;
+
+  --secondary: #f0ede9;
+  --secondary-foreground: #0e1217;
+
+  /* Fundo rebaixado e o texto de apoio (6.80:1). */
+  --muted: #f0ede9;
+  --muted-foreground: #5f5a58;
+
+  /* Hover suave; o texto por cima volta ao vinho. */
+  --accent: #edf2ea;
+  --accent-foreground: #2f4a2b;
+
+  /* O vinho aberto, 7.21:1 — separa do primary pelo brilho, não pelo matiz. */
+  --destructive: #a8202f;
+
+  --border: #e4ded7;
+  --input: #e4ded7;
+  /* 5.37:1 — o ocre, bem acima do mínimo de 3:1 para foco. */
+  --ring: #8a6410;
+
+  --radius: 0.5rem;
+
+  /* Dialeto da casa que os componentes próprios continuam falando: o mesmo
+     cartão com outro nome. É apelido de --card para os dois não se
+     separarem (a faixa escura do topo redefine o seu). */
+  --surface: var(--card);
+  --ok: #0e1217;
+  --warn: #8a6410;
+  --danger-soft: #fbe9ea;
+  /* O irmão claro de `--danger-soft`, e só para fundo.
+     Nasceu na contagem, onde o campo preenchido precisava dizer "este está
+     gravado" de relance, com trezentos e trinta campos na tela e o celular a
+     um braço de distância — um visto de doze pixels não faz isso. Verde é a
+     única cor que o dialeto ainda não tinha, e ela entra pelo mesmo papel do
+     vermelho suave: pintar a caixa, nunca o texto. */
+  --ok-soft: #e8f3ea;
+  /* Um passo mais verde que `--ok-soft`, e ainda claro: o texto por cima
+     continua o preto da casa.
+     São dois tons e não um porque no mapa eles aparecem um DENTRO do outro —
+     `--ok-soft` pinta a linha do item já resolvido, este pinta a célula do
+     fornecedor escolhido. Com o mesmo tom, a escolha sumiria dentro da
+     própria linha que ela resolveu. */
+  --ok-mid: #cfe6d5;
+  /* O verde escuro, para texto e desenho sobre fundo claro (6.4:1). */
+  --ok-strong: #1d6b3f;
+  /* O vinho da casa diluído, e só para fundo.
+     Existe para NÃO usar `--danger-soft` onde não há erro: aquele é o
+     vermelho do que deu errado, e pintar com ele uma faixa de ferramentas
+     faria a tela gritar sobre um lugar onde não há nada de errado. Este é o
+     mesmo vermelho da marca, claro o bastante para o texto por cima
+     continuar preto e para o botão de fundo branco se destacar dele. */
+  --primary-soft: #eef3ec;
+  /* O ouro de `--warn` diluído, e só para fundo — o texto por cima é o
+     próprio `--warn`. Nasceu no link do fornecedor, para "sem estoque" e
+     "não trabalho": não é erro, é um "não" que a casa precisa enxergar. */
+  --warn-soft: #fbf1d9;
+  /* O relevo que separa o que clica do que só está escrito.
+     Um pixel de sombra, e é de propósito: mais que isso vira cartão
+     flutuando, e a tela de cotação já tem tabela, faixa e cartão disputando
+     profundidade. */
+  --relevo: 0 1px 2px 0 rgb(0 0 0 / 0.07);
+
+  --chart-1: #2f4a2b;
+  --chart-2: #8a6410;
+  --chart-3: #a8202f;
+  --chart-4: #5f5a58;
+  --chart-5: #e4ded7;
+
+  /* O botão cheio: fundo e texto. Na página pública é o próprio vinho;
+     o painel troca pelo limão (ver `.tema-painel` abaixo). Separado de
+     `--primary` porque lá o limão serve para encher botão, mas não para
+     escrever: sobre branco ele dá 1.9:1. */
+  --botao: var(--primary);
+  --botao-texto: var(--primary-foreground);
+
+  --sidebar: #faf8f5;
+  --sidebar-foreground: #0e1217;
+  --sidebar-primary: #2f4a2b;
+  --sidebar-primary-foreground: #faf8f5;
+  --sidebar-accent: #edf2ea;
+  --sidebar-accent-foreground: #2f4a2b;
+  --sidebar-border: #e4ded7;
+  --sidebar-ring: #8a6410;
+}
+
+/*
+  O PAINEL: a paleta da Stone, a pedido do dono (02/10).
+
+  Vale para tudo que é de dentro da casa — /admin, os atalhos, os links do
+  estoquista e do fornecedor —, marcados com `.tema-painel` no layout de cada
+  um. A página de reservas que o cliente abre continua com preto, dourado e
+  vinho: ela é a cara do restaurante para fora, e vestida de Stone pareceria
+  página da Stone.
+
+  `:root:has(...)`, e não a classe no próprio contêiner: assim o fundo da
+  página, a barra de rolagem e o que abre por cima (menus, diálogos, que
+  nascem fora do contêiner) pegam as mesmas cores.
+
+  Os tons saíram dos prints do app e do logo (#00461E e #00D700) e o
+  contraste foi medido: texto verde #186618 dá 7.1:1 no branco e 5.9:1 no
+  cinza do fundo; o verde-escuro sobre o limão dá 5.7:1. O limão nunca é
+  texto nem traço fino sobre fundo claro (1.9:1): só enche botão.
+*/
+:root:has(.tema-painel) {
+  --background: #e7eae9;
+  /* O cinza do fundo com outro nome, para quem está dentro da faixa verde
+     (que troca o --background) ainda alcançar a cor da folha. */
+  --fundo-da-pagina: #e7eae9;
+  --foreground: #1b1f1d;
+
+  --primary: #186618;
+  --primary-foreground: #ffffff;
+
+  --botao: #00d700;
+  --botao-texto: #00461e;
+
+  --card: #ffffff;
+  --card-foreground: #1b1f1d;
+  --popover: #ffffff;
+  --popover-foreground: #1b1f1d;
+
+  --secondary: #eef0ef;
+  --secondary-foreground: #1b1f1d;
+  --muted: #eef0ef;
+  /* 6.2:1 no branco, 5.2:1 no cinza do fundo. */
+  --muted-foreground: #5c625f;
+
+  --accent: #e3fddf;
+  --accent-foreground: #186618;
+
+  /* 6.6:1 no branco. */
+  --destructive: #b42318;
+  --border: #dfe3e1;
+  --input: #d5dad7;
+  --ring: #186618;
+
+  /* Cantos mais redondos, como os cartões da Stone: 12px no que se toca,
+     ~17px nos cartões (rounded-xl). */
+  --radius: 0.75rem;
+
+  --surface: var(--card);
+  --ok: #1b1f1d;
+  /* O laranja-terra dos estornos, 5.4:1 no branco. */
+  --warn: #9a5b13;
+  --danger-soft: #fdebeb;
+  --ok-soft: #e8f8e5;
+  --ok-mid: #c9eec4;
+  --ok-strong: #186618;
+  --primary-soft: #e3fddf;
+  --warn-soft: #ffefd5;
+  --relevo: 0 1px 3px 0 rgb(0 0 0 / 0.08);
+
+  --chart-1: #186618;
+  --chart-2: #00a868;
+  --chart-3: #9a5b13;
+  --chart-4: #5c625f;
+  --chart-5: #dfe3e1;
+
+  --sidebar: #00461e;
+  --sidebar-foreground: #ffffff;
+  --sidebar-primary: #00d700;
+  --sidebar-primary-foreground: #00461e;
+  --sidebar-accent: rgb(255 255 255 / 0.1);
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: rgb(255 255 255 / 0.14);
+  --sidebar-ring: #00d700;
+}
+
+/*
+  Cartão é branco sobre o cinza, como na Stone. Muitos cartões do painel
+  nasceram só com borda, transparentes sobre o fundo branco de antes; aqui
+  eles ficariam cinza-sobre-cinza. A regra pega o que tem borda e canto
+  arredondado e não diz fundo nenhum — quem pinta o próprio fundo continua
+  mandando.
+*/
+:root:has(.tema-painel) :is(.rounded-lg, .rounded-xl, .rounded-2xl).border:not([class*="bg-"]) {
+  background-color: var(--surface);
+}
+
+/*
+  Campos e títulos do painel, numa medida só.
+
+  Os campos nasceram tela a tela, com cinco alturas e três cantos — lado a
+  lado, um filtro de 32px ao lado de uma busca de 44px parecia remendo. Aqui:
+  44px de altura mínima (o alvo de toque confortável), o canto do resto do
+  painel e letra de 16px, que é também o que impede o iPhone de dar zoom ao
+  tocar no campo. Campo que pediu letra miúda de propósito (`text-xs`, nas
+  grades densas) fica com ela.
+*/
+:root:has(.tema-painel)
+  :is(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="hidden"]), select) {
+  min-height: 2.75rem;
+  border-radius: var(--radius);
+}
+:root:has(.tema-painel)
+  :is(input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="hidden"]), select, textarea):not([class*="text-xs"]) {
+  font-size: 1rem;
+}
+:root:has(.tema-painel) textarea {
+  border-radius: var(--radius);
+}
+:root:has(.tema-painel) select:not([class*="bg-"]) {
+  background-color: var(--surface);
+}
+
+/* O título de cada tela, um tamanho só (eram seis). */
+:root:has(.tema-painel) h1:not(.phrase, .sr-only) {
+  font-size: 1.5rem;
+  line-height: 1.25;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+/*
+  A faixa verde-escura do topo (e a coluna dos módulos no computador): as
+  mesmas variáveis, redefinidas só ali dentro, para o que está nela — nome
+  da casa, ☰, links do menu — virar claro sobre o escuro sem ninguém
+  precisar saber que está numa faixa. O limão volta a ser texto aqui, porque
+  sobre o verde-escuro ele dá 5.7:1.
+*/
+.faixa-escura {
+  --background: #00461e;
+  --surface: #00461e;
+  --foreground: #ffffff;
+  --muted: rgb(255 255 255 / 0.1);
+  --muted-foreground: #c7d6cc;
+  --primary: #00d700;
+  --primary-foreground: #00461e;
+  --border: rgb(255 255 255 / 0.14);
+  --accent: rgb(255 255 255 / 0.1);
+  --accent-foreground: #ffffff;
+  --ring: #00d700;
+  background: var(--surface);
+  color: var(--foreground);
+}
+
+/*
+  O cabeçalho de cada tela (`CabecalhoDaPagina`), como no app do banco: o
+  título sobre o verde-escuro que desce da barra do alto, e o conteúdo numa
+  folha cinza de cantos redondos que sobe por cima do verde.
+
+  O cabeçalho mora dentro do `main` (centrado, até 56rem, com 1.25rem de
+  margem); o verde e a folha vão de ponta a ponta da coluna do conteúdo, que
+  é um contêiner (`@container` no layout). `--recuo` é a distância do
+  cabeçalho até a borda da coluna: a sobra do `main` centrado mais a margem.
+  Sobe por cima do respiro do alto do `main` (`--respiro-topo`).
+*/
+.cabecalho-verde {
+  /* `--largura-do-main`: as páginas de link (estoquista) têm o `main` mais estreito. */
+  --recuo: calc((100cqw - min(100cqw, var(--largura-do-main, 56rem))) / 2 + 1.25rem);
+  position: relative;
+  isolation: isolate;
+  background: transparent;
+  /* O que as telas põem no cabeçalho (setas, selos, botões) pensando no
+     fundo claro, em tons que se leem sobre o verde-escuro. */
+  --card: rgb(255 255 255 / 0.08);
+  --card-foreground: #ffffff;
+  --secondary: rgb(255 255 255 / 0.12);
+  --secondary-foreground: #ffffff;
+  --ok-strong: #00d700;
+  --warn: #ffc56b;
+  --destructive: #ff9b8f;
+  margin-top: calc(-1 * var(--respiro-topo, 2rem));
+  /* A folha (o ::after) já é o respiro até o conteúdo: sem margem embaixo,
+     mesmo dentro de um `space-y`. */
+  margin-bottom: 0;
+  padding-top: 1.25rem;
+  padding-bottom: 2.75rem;
+}
+.cabecalho-verde::before,
+.cabecalho-verde::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  left: calc(-1 * var(--recuo));
+  width: 100cqw;
+}
+.cabecalho-verde::before {
+  top: 0;
+  bottom: 0;
+  background: #00461e;
+}
+.cabecalho-verde::after {
+  bottom: 0;
+  height: 1.5rem;
+  background: var(--fundo-da-pagina);
+  border-radius: 1.5rem 1.5rem 0 0;
+}
+@media print {
+  .cabecalho-verde {
+    margin-top: 0;
+    padding: 0;
+    --foreground: #000;
+    --muted-foreground: #444;
+    --primary: #186618;
+    color: #000;
+  }
+  .cabecalho-verde::before,
+  .cabecalho-verde::after {
+    display: none;
+  }
+}
+
+/*
+  O contrário da faixa: a caixa branca que abre de dentro dela (o menu do
+  sino e da conta) volta às cores do painel.
+*/
+.tema-claro {
+  --background: #e7eae9;
+  --surface: #ffffff;
+  --foreground: #1b1f1d;
+  --muted: #eef0ef;
+  --muted-foreground: #5c625f;
+  --primary: #186618;
+  --primary-foreground: #ffffff;
+  --border: #dfe3e1;
+  --accent: #e3fddf;
+  --accent-foreground: #186618;
+  --ring: #186618;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-line: var(--border);
+  --color-accent: var(--primary);
+  --font-sans: var(--font-ui);
+  --font-mono: var(--font-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-ui), system-ui, sans-serif;
+  caret-color: var(--primary);
+}
+
+/* As partes que o navegador desenha também são da casa. Seleção, cursor e
+   barra de rolagem saem de fábrica em azul de sistema, que não pertence a
+   paleta nenhuma. */
+::selection {
+  background: color-mix(in srgb, var(--primary) 22%, transparent);
+  color: var(--foreground);
+}
+
+* {
+  scrollbar-color: var(--border) transparent;
+  scrollbar-width: thin;
+}
+
+@layer components {
+  /* --- a frase ---------------------------------------------------------
+     O valor escolhido é um botão do tamanho do texto ao redor: a frase se
+     lê inteira, mas cada número é tocável. */
+  .phrase {
+    font-family: var(--font-ui), system-ui, sans-serif;
+    /* Esticado a 118 e pesado: é a mesma letra da interface aberta até virar
+       letreiro. A largura carrega a ênfase, então o corpo pode ficar menor
+       que numa serifada e ainda dominar a tela. */
+    font-variation-settings: "wdth" 118, "wght" 640;
+    font-size: clamp(1.45rem, 5.6vw, 2.05rem);
+    line-height: 1.3;
+    letter-spacing: -0.02em;
+  }
+
+  .phrase-slot {
+    /* px-1: a caixa respira sem abrir buraco antes da vírgula que a segue. */
+    @apply rounded-md px-1 font-semibold text-[var(--primary)] transition;
+    background: color-mix(in srgb, var(--primary) 9%, transparent);
+    box-shadow: inset 0 -0.12em 0 color-mix(in srgb, var(--primary) 35%, transparent);
+    /* Data longa que quebra em duas linhas ganha caixa e sublinhado inteiros
+       nos dois pedaços, em vez de um retângulo partido ao meio. */
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+  }
+
+  .phrase-slot:hover,
+  .phrase-slot[aria-expanded="true"] {
+    background: color-mix(in srgb, var(--primary) 16%, transparent);
+  }
+
+  .phrase-slot--empty {
+    @apply whitespace-nowrap text-[var(--muted-foreground)];
+    background: color-mix(in srgb, var(--muted-foreground) 10%, transparent);
+    box-shadow: inset 0 -0.12em 0 color-mix(in srgb, var(--muted-foreground) 30%, transparent);
+  }
+
+  /* Passada a primeira etapa a frase deixa de ser o herói e vira registro
+     corrido do que já foi decidido — mesma voz, meia altura. */
+  .phrase--compact {
+    font-size: clamp(1.05rem, 3.6vw, 1.25rem);
+    line-height: 1.5;
+  }
+
+  /* --- calendário da reserva guiada ------------------------------------
+     O dia é a resposta: tocar já avança. Fechado risca e não clica. */
+  .cal-day {
+    @apply relative mx-auto flex h-11 w-11 items-center justify-center rounded-lg
+      text-[15px] tabular-nums transition
+      hover:bg-[var(--accent)]
+      disabled:pointer-events-none;
+  }
+
+  /* Ponto sob o número: os dias em que dá para reservar se anunciam sozinhos,
+     em vez de exigir um toque para descobrir. Marca "a casa abre" — quantos
+     lugares sobram depende do tamanho do grupo, perguntado na etapa 2. */
+  .cal-day[data-open]::after {
+    content: "";
+    position: absolute;
+    bottom: 6px;
+    left: 50%;
+    height: 5px;
+    width: 5px;
+    transform: translateX(-50%);
+    border-radius: 9999px;
+    background: var(--primary);
+  }
+
+  /* No dia escolhido o fundo já é o acento; o ponto vira o vazado dele. */
+  .cal-day[aria-pressed="true"][data-open]::after {
+    background: var(--surface);
+  }
+
+  .cal-day[data-today] {
+    @apply font-semibold text-[var(--primary)];
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 45%, transparent);
+  }
+
+  .cal-day[aria-pressed="true"] {
+    @apply bg-[var(--primary)] font-semibold text-[var(--surface)];
+    box-shadow: none;
+  }
+
+  .cal-day:disabled {
+    @apply text-[var(--muted-foreground)] opacity-45;
+  }
+
+  /* Fechado é diferente de "fora do prazo": um risco diz que a casa não abre. */
+  .cal-day[data-state="closed"] {
+    text-decoration: line-through;
+    text-decoration-color: color-mix(in srgb, var(--muted-foreground) 70%, transparent);
+  }
+
+  /* Trocar de mês é a segunda coisa mais feita nesta tela, depois de
+     escolher o dia — o círculo vinho dá a ela o peso de um comando, não de
+     um enfeite de canto. 44px também é o alvo de toque mínimo, então o
+     destaque e o dedo pedem a mesma coisa. */
+  .cal-arrow {
+    @apply flex h-11 w-11 items-center justify-center rounded-full border
+      border-[var(--primary)] text-lg leading-none text-[var(--primary)]
+      transition
+      hover:bg-[var(--primary)] hover:text-[var(--primary-foreground)]
+      disabled:pointer-events-none disabled:border-[var(--border)]
+      disabled:text-[var(--muted-foreground)] disabled:opacity-40;
+  }
+
+  /* --- fichas de escolha ---------------------------------------------- */
+  /* Campo de data no celular sem o ícone de calendário: tocar no campo já
+     abre o calendário, e o ícone tirava o espaço da própria data — com as
+     duas datas e o "Ver" numa linha, a data aparecia cortada. */
+  @media (max-width: 639px) {
+    .data-compacta::-webkit-calendar-picker-indicator {
+      display: none;
+    }
+  }
+
+  .chip {
+    @apply rounded-lg border border-[var(--border)] bg-[var(--surface)]
+      px-3.5 py-2.5 text-[15px] font-medium tabular-nums transition
+      hover:border-[var(--primary)];
+  }
+
+  .chip[aria-pressed="true"],
+  .chip[aria-current="page"] {
+    @apply border-[var(--primary)] bg-[var(--primary)] text-[var(--surface)];
+  }
+
+  /* --- selo de estado --------------------------------------------------- */
+  /* Irmão visual do .chip e o oposto dele em papel: .chip é controle, com
+     hover e aria-pressed; o selo só informa em que pé a coisa está, e não
+     reage ao mouse. A Cotação usava .chip para isso, e o estado da rodada
+     acendia ao passar o cursor como se desse para clicar.
+
+     O fundo sai de currentColor: quem usa já define a cor pelo tom (corDoTom,
+     em lib/cotacao-labels.ts), então o tingido acompanha sozinho, sem uma
+     variante de classe por tom. */
+  .selo {
+    @apply inline-flex items-center rounded-md px-2 py-0.5 text-xs font-semibold;
+    background: color-mix(in srgb, currentColor 12%, transparent);
+  }
+
+  /* --- formulário ------------------------------------------------------ */
+  .field {
+    @apply w-full rounded-lg border border-[var(--border)] bg-[var(--surface)]
+      px-3 py-2.5 text-[15px] text-[var(--foreground)]
+      outline-none transition
+      focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary)]/25;
+  }
+
+  .label {
+    @apply mb-2 block text-sm font-medium text-[var(--foreground)];
+  }
+
+  /* Em linha própria, sempre: num <span> dentro do <label>, a dica ficava
+     colada ao lado do campo, quebrando no meio da tela. */
+  .hint {
+    @apply mt-2 block text-xs text-[var(--muted-foreground)];
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center rounded-lg bg-[var(--botao)]
+      px-5 py-3.5 text-[15px] font-semibold text-[var(--botao-texto)] transition
+      hover:opacity-90 focus:outline-none focus:ring-2 focus:ring-[var(--primary)]/40
+      disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .btn-ghost {
+    @apply inline-flex min-h-10 items-center justify-center rounded-lg border
+      border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5 text-sm font-semibold
+      text-[var(--foreground)] transition hover:border-[var(--primary)]
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .card {
+    @apply rounded-xl border border-[var(--border)] bg-[var(--surface)];
+  }
+
+  /* --- assinatura: o sublinhado-interno marca o que está ativo ---------- */
+  .nav-link {
+    @apply rounded-md px-1.5 py-0.5 text-sm text-[var(--muted-foreground)] transition
+      hover:text-[var(--foreground)] active:bg-[var(--muted)];
+  }
+
+  /* --- navegação pendente ---------------------------------------------- */
+  /* O toque pegou e a tela nova ainda não chegou: um ponto no item tocado e
+     uma barra fina no topo (components/indicador-de-link.tsx). Entram com um
+     atraso curto, para não piscar quando a troca é imediata. */
+  .ponto-navegando {
+    @apply ml-auto size-2 shrink-0 rounded-full bg-[var(--primary)];
+    animation:
+      navegando-aparece 0.15s ease-out 0.1s both,
+      navegando-pulsa 0.9s ease-in-out 0.25s infinite;
+  }
+
+  .barra-navegando {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 60;
+    height: 3px;
+    background: var(--primary);
+    animation: navegando-barra 4s cubic-bezier(0.1, 0.7, 0.3, 1) 0.1s both;
+  }
+
+  .nav-link[aria-current] {
+    @apply font-semibold text-[var(--primary)];
+    background: color-mix(in srgb, var(--primary) 9%, transparent);
+    box-shadow: inset 0 -0.14em 0 color-mix(in srgb, var(--primary) 35%, transparent);
+  }
+
+  /* --- números protagonistas ------------------------------------------- */
+  /* Horário, lugares, telefone: em mono eles alinham em coluna sem tabela e
+     leem como comanda. É o único lugar onde o mono aparece — por isso ele
+     marca "isto é um número que importa". */
+  .num-display {
+    font-family: var(--font-mono), ui-monospace, monospace;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.03em;
+  }
+
+  /* O letreiro: título de tela, esticado, em caixa alta curta. */
+  .sign {
+    font-family: var(--font-ui), system-ui, sans-serif;
+    font-variation-settings: "wdth" 115, "wght" 700;
+    letter-spacing: -0.01em;
+  }
+
+  /* --- rótulo de seção (substitui card+título nas telas de config) ------ */
+  /* Espaçamento de 0,06em: com 0,22em as letras se soltavam ("E M  A N D A
+     M E N T O") e o rótulo lia como enfeite, não como título. */
+  .section-label {
+    @apply text-xs font-semibold tracking-[0.06em] text-[var(--muted-foreground)] uppercase;
+  }
+
+  /* --- mensagens com papel semântico, uma grafia só --------------------- */
+  .msg-error {
+    @apply rounded px-4 py-3 text-sm font-medium;
+    color: var(--destructive);
+    background: var(--danger-soft);
+  }
+
+  .msg-warn {
+    @apply rounded px-4 py-3 text-sm;
+    color: var(--foreground);
+    background: color-mix(in srgb, var(--warn) 14%, var(--surface));
+  }
+
+  /* --- caixa que pede uma decisão antes de mexer no que já está gravado -- */
+  .card-alerta {
+    @apply rounded-xl border;
+    border-color: color-mix(in srgb, var(--destructive) 35%, transparent);
+    background: var(--danger-soft);
+  }
+
+  .error {
+    @apply mt-1 text-xs font-medium;
+    color: var(--destructive);
+  }
+}
+
+/* Foco sempre visível — a página é usada com teclado e leitor de tela. */
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+@keyframes navegando-aparece {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes navegando-pulsa {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes navegando-barra {
+  from {
+    width: 0;
+  }
+  to {
+    width: 90%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+/*
+  ---break---
+*/
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+/* ---------------------------------------------------------------------------
+   Relevo nos botões da cotação.
+
+   A seção inteira de uma vez, e não botão por botão: são umas trinta caixas
+   clicáveis espalhadas por cinco arquivos — alvo de preço, confirmar compra,
+   as rodinhas do item, copiar link, WhatsApp, os ok/sair de cada painel — e
+   uma classe a mais em cada uma é uma que alguém esquece na próxima que
+   nascer.
+
+   O gancho é `data-secao="cotacao"`, posto na raiz das duas telas. Fora
+   delas nada muda: o resto do sistema continua com os botões chapados, e
+   mudar isso é outra decisão, de outro dia.
+
+   Dentro de `data-sem-relevo` nada ganha sombra: os quadrados de ação
+   (a lista de fornecedores) são desenhados sem caixa, como no resto.
+
+   `:not(:disabled)` porque botão desligado não é clicável, e dar relevo a
+   ele seria a tela prometendo um toque que ela mesma recusa.
+   --------------------------------------------------------------------------- */
+[data-secao="cotacao"] button:not(:disabled):not([data-sem-relevo]):not([data-sem-relevo] *),
+[data-secao="cotacao"] a[data-relevo] {
+  box-shadow: var(--relevo);
+}
+
+/* --- sombra dos campos no link do fornecedor -----------------------------
+   A pedido do dono: caixas de digitar, listas de seleção e botões de
+   escolha (1 KG / Pacote / KG, Sim / Não) com uma sombra que os tira do
+   fundo. Quem enxerga pouco precisa ver de relance onde se toca e onde se
+   digita; com a borda fina sozinha, a caixa vazia sumia no bege do cartão.
+
+   Mais marcada que `--relevo` de propósito: aquele é um pixel para botões
+   de uma tela cheia de tabela; aqui é o próprio campo que tem de aparecer.
+   `:not(:focus)` para não apagar o anel de foco, que também é sombra. */
+[data-secao="fornecedor"] input:not(:focus),
+[data-secao="fornecedor"] select:not(:focus),
+[data-secao="fornecedor"] .chip,
+[data-secao="fornecedor"] [data-sombra] {
+  box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.14), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+}
+
+/* O que aparece na tela e não sai no papel (os botões da folha, filtros). */
+@media print {
+  .nao-imprimir {
+    display: none !important;
+  }
+}
+
+/* A faixa de aviso (`components/aviso-do-topo.tsx`) sobe de baixo. */
+@keyframes subir {
+  from {
+    opacity: 0;
+    transform: translateY(0.75rem);
+  }
+}
+
+/* A barra de baixo do celular (`app/admin/barra-de-baixo.tsx`): a altura
+   dela, com a área do gesto do iPhone, para o que também fica preso embaixo
+   (o aviso com Desfazer, o "+ Nova tarefa", as barras de Salvar) subir acima
+   dela. Sem a barra na tela (no computador, no login, no link de atalhos),
+   vale zero e nada muda. */
+:root {
+  --barra-de-baixo: 0px;
+}
+@media (width < 64rem) {
+  :root:has(.barra-de-baixo) {
+    --barra-de-baixo: calc(4rem + env(safe-area-inset-bottom));
+  }
+}
+
+/* O menu do celular entra pela direita. */
+@keyframes entrar-da-direita {
+  from {
+    transform: translateX(100%);
+  }
+}
+@keyframes escurecer {
+  from {
+    opacity: 0;
+  }
+}

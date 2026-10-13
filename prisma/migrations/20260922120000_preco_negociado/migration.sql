@@ -1,0 +1,18 @@
+-- De quanto o fornecedor baixou quando a casa negociou.
+--
+-- A cotação termina com um preço por fornecedor e por item, e até aqui ele
+-- era intocável: o que ele digitou no link é o que valia. Mas o preço de
+-- verdade sai de uma conversa depois disso — o dono manda mensagem, pede
+-- melhora, e fecha noutro número. Esse número não tinha onde morar, e a
+-- alternativa era comprar por um preço que a tela nunca soube.
+--
+-- Agora `precoUnitario` passa a ser o preço ACERTADO, e esta coluna guarda o
+-- que ele tinha cotado antes. Nulo é o normal: ninguém negociou aquela linha.
+--
+-- Guardar o original em vez de sobrescrever calado é o ponto: "R$ 1,09 →
+-- R$ 0,95" é o que diz se negociar com este fornecedor rende, e é o que se
+-- leva para a rodada seguinte. Sem ele, a conversa não deixa rastro nenhum.
+--
+-- Nada muda nas linhas que já existem: todas nascem nulas, e uma cotação sem
+-- negociação nenhuma continua exatamente como está.
+ALTER TABLE "precos" ADD COLUMN "precoNegociadoDe" DECIMAL(10,2);

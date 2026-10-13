@@ -1,0 +1,22 @@
+-- Quanto DESTE item sai de CADA fornecedor, quando a compra é dividida.
+--
+-- Até aqui a cotação tinha um vencedor por item, e a razão estava escrita:
+-- dois "sim" numa linha só seriam o mesmo tomate pedido a dois fornecedores.
+-- Só que a vida da casa tem o caso contrário — o que tem o melhor preço não
+-- tem a quantidade toda, ou entrega metade hoje e metade na quinta. Sem esta
+-- coluna a saída era mentir numa das pontas: pedir tudo a quem não pode
+-- entregar tudo, ou pedir a um só e completar por fora, sem registro.
+--
+-- Nulo é o normal, e é o que todas as linhas de hoje passam a ser: "leva o
+-- item inteiro". É `CotacaoItem.quantidadeSolicitada` quem responde nesse
+-- caso, exatamente como antes desta coluna existir.
+--
+-- Preenchido, vale isto e não aquilo — e a soma das partes fecha a
+-- quantidade do item, que é o que a ação de dividir exige antes de gravar.
+--
+-- ATENÇÃO ao que esta coluna NÃO é: ela não mexe em `subtotal`. `subtotal`
+-- continua sendo "quanto custaria comprar TUDO deste fornecedor", que é o
+-- número que torna as colunas comparáveis e o que elege o mais barato. Se a
+-- divisão o encolhesse, o mapa passaria a comparar pedaços de tamanhos
+-- diferentes e a coroa iria para quem levou a menor fatia.
+ALTER TABLE "precos" ADD COLUMN "quantidadeAprovada" DECIMAL(10,3);

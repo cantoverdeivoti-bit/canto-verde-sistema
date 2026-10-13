@@ -1,0 +1,20 @@
+-- Como a casa chama o fornecedor, e não como ele se chama na nota.
+--
+-- O cadastro guarda a razão social, que é o que vai no CNPJ e na nota
+-- fiscal: "Himalaia Com. de Prod. Alimentares Ltda". Está certo, e precisa
+-- continuar lá. Só que a tela de cotação põe esse nome em cabeçalho de
+-- coluna de 96px e em cartão de celular, e ali ele não cabe — vira
+-- "Himalaia Com. de Prod. Alime…" em cinco lugares, e quem lê perde três
+-- segundos por coluna reconhecendo quem é.
+--
+-- Na cabeça de quem compra ele é "Himalaia", e é isso que esta coluna
+-- guarda.
+--
+-- Nulo é o normal e quer dizer "use a razão social" — nenhum cadastro de
+-- hoje precisa ser tocado, e um fornecedor cujo nome já é curto nunca vai
+-- precisar de apelido.
+--
+-- 40 caracteres: é apelido, não um segundo nome. O limite existe para a
+-- coluna estreita continuar estreita — sem ele, alguém cola a razão social
+-- aqui dentro e o problema volta pela porta que veio consertá-lo.
+ALTER TABLE "suppliers" ADD COLUMN "apelido" VARCHAR(40);

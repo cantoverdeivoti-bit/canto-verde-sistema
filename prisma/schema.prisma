@@ -1,0 +1,4779 @@
+// Sistema de reservas — Canto Verde
+//
+// O modelo separa deliberadamente TRÊS domínios de configuração que costumam
+// ser misturados: regras de reserva, capacidade física e notificação.
+// Misturá-los é a origem dos problemas encontrados na configuração atual
+// (aprovar automaticamente sem saber a capacidade, prometer fila de espera
+// desligada, avisar o cliente à mão).
+
+generator client {
+  provider        = "prisma-client"
+  output          = "../generated/prisma"
+  // Relações (o fornecedor do pedido, os itens, o produto de cada item) numa
+  // consulta só, com JOIN, em vez de uma ida ao banco por nível. Cada ida
+  // custa a distância até o banco: Pendências caía de 55 consultas para
+  // poucas, e a tela abre mais rápido no celular.
+  previewFeatures = ["relationJoins"]
+}
+
+// Prisma 7: as URLs de conexão ficam em prisma7.config.ts (migrations) e no
+// driver adapter em lib/db.ts (runtime), não mais aqui.
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Domínio 1 — Regras de reserva
+// ---------------------------------------------------------------------------
+
+enum AdvanceUnit {
+  MINUTES
+  HOURS
+  DAYS
+  WEEKS
+  MONTHS
+}
+
+/// Linha única (id = 1). Política de quem pode reservar, quando e como.
+model ReservationRules {
+  id          Int     @id @default(1)
+  isActive    Boolean @default(true)
+  selfService Boolean @default(true)
+
+  // Antecedência: valor + unidade (ex.: máximo 2 MONTHS, mínimo 2 HOURS)
+  maxAdvanceValue Int         @default(2)
+  maxAdvanceUnit  AdvanceUnit @default(MONTHS)
+  minAdvanceValue Int         @default(2)
+  minAdvanceUnit  AdvanceUnit @default(HOURS)
+
+  /// Tolerância de atraso: até aqui o lugar continua guardado.
+  delayToleranceMinutes Int @default(15)
+
+  // Tamanho de grupo e política de aprovação.
+  // A tríade abaixo evita que grupos grandes sejam recusados em silêncio:
+  //   party <= autoApproveUpTo  -> confirma na hora
+  //   party <= maxPartySize     -> entra como PENDING para aprovação manual
+  //   party >  maxPartySize     -> pede contato direto
+  minPartySize      Int     @default(1)
+  maxPartySize      Int     @default(8)
+  autoApproveUpTo   Int     @default(6)
+  manualIfOverLimit Boolean @default(true)
+
+  /// Previsto para o futuro (sinal / caução). Não implementado na v1.
+  paymentRequired Boolean @default(false)
+
+  /// Controla o texto da página pública. Se false, o site NÃO menciona fila
+  /// de espera — a página nunca promete o que o sistema não faz.
+  waitlistEnabled Boolean @default(false)
+
+  /// Aviso da casa, escrito pelo dono, mostrado antes de confirmar e na
+  /// página da reserva. Texto livre com quebras de linha; nulo = sem aviso.
+  bookingNotice String?
+
+  /// O que a página de reserva mostra da casa, no topo. Tudo opcional: em
+  /// branco, a linha some. O mapa sai do endereço; o WhatsApp é só número,
+  /// com o 55 do país (ex.: 5551999999999).
+  endereco   String? @db.VarChar(200)
+  whatsapp   String? @db.VarChar(20)
+  sobreACasa String? @db.VarChar(200)
+  fotoUrl    String? @db.VarChar(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("reservation_rules")
+}
+
+// ---------------------------------------------------------------------------
+// Domínio 2 — Capacidade física
+// ---------------------------------------------------------------------------
+
+/// Linha única (id = 1). `totalCapacity` não tem default: o sistema não opera
+/// sem saber quantos lugares existem, o que torna o overbooking estrutural
+/// impossível em vez de apenas improvável.
+model CapacitySettings {
+  id       Int    @id @default(1)
+  name     String
+  timezone String @default("America/Sao_Paulo")
+
+  /// Lugares simultâneos no salão. Obrigatório.
+  totalCapacity Int
+
+  /// Quanto tempo uma reserva ocupa a mesa.
+  defaultDurationMinutes Int @default(90)
+
+  /// Folga de turnover somada ao fim de cada reserva.
+  bufferMinutes Int @default(0)
+
+  /// Granularidade dos horários oferecidos ao cliente (ex.: de 30 em 30 min).
+  slotIntervalMinutes Int @default(30)
+
+  /// Abaixo disso, o painel alerta que a grade do dia está rala.
+  minSlotsWarningThreshold Int @default(3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("capacity_settings")
+}
+
+/// Grade semanal recorrente. Múltiplas linhas por dia permitem turnos
+/// separados (almoço e jantar) sem migration futura.
+model BusinessHours {
+  id        Int     @id @default(autoincrement())
+  /// 0 = domingo ... 6 = sábado
+  dayOfWeek Int
+  shiftName String?
+  /// "HH:MM" no horário local do restaurante
+  opensAt   String
+  /// Fechamento do salão. O último horário reservável é closesAt - duração.
+  closesAt  String
+  isActive  Boolean @default(true)
+
+  @@index([dayOfWeek])
+  @@map("business_hours")
+}
+
+/// Feriados, fechamentos e overrides pontuais.
+/// Datas passadas são ignoradas em todas as consultas de disponibilidade.
+model SpecialDate {
+  id               Int      @id @default(autoincrement())
+  date             DateTime @unique @db.Date
+  isClosed         Boolean  @default(true)
+  opensAt          String?
+  closesAt         String?
+  capacityOverride Int?
+  note             String?
+
+  createdAt DateTime @default(now())
+
+  @@map("special_dates")
+}
+
+// ---------------------------------------------------------------------------
+// Domínio 3 — Notificação
+// ---------------------------------------------------------------------------
+
+enum NotificationChannel {
+  EMAIL_AUTO
+  MANUAL
+}
+
+/// Linha única (id = 1). Separada das regras porque avisar o cliente e
+/// aprovar a reserva são decisões independentes — juntá-las é o que cria o
+/// vão entre "confirmou sozinho" e "alguém precisa lembrar de avisar".
+model NotificationSettings {
+  id                Int                 @id @default(1)
+  restaurantEmail   String
+  notifyRestaurant  Boolean             @default(true)
+  notifyCustomer    Boolean             @default(true)
+  channel           NotificationChannel @default(EMAIL_AUTO)
+  /// Horas de antecedência do lembrete ao cliente. Null desliga o lembrete.
+  sendReminderHours Int?                @default(24)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("notification_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Núcleo
+// ---------------------------------------------------------------------------
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum ReservationSource {
+  PUBLIC
+  ADMIN
+}
+
+/// Cada reserva é um intervalo ocupado [startTime, endTime) com peso
+/// `partySize`. A disponibilidade é a soma dos pesos que se sobrepõem —
+/// não há alocação de mesa individual.
+model Reservation {
+  id            String  @id @default(uuid())
+  customerName  String
+  /// Normalizado em E.164 (ex.: +5551999999999)
+  customerPhone String
+  customerEmail String?
+  partySize     Int
+
+  /// Data local do restaurante. Redundante com startTime de propósito:
+  /// permite filtrar "reservas de hoje" sem conversão de timezone.
+  serviceDate DateTime @db.Date
+
+  startTime DateTime @db.Timestamptz(3)
+  /// startTime + duração + buffer
+  endTime   DateTime @db.Timestamptz(3)
+
+  /// Snapshot da duração vigente no momento da reserva. Nunca recalculado a
+  /// partir das settings — mudar o padrão amanhã não pode alterar o passado.
+  durationMinutes Int
+
+  status ReservationStatus @default(CONFIRMED)
+  notes  String?
+  source ReservationSource @default(PUBLIC)
+
+  /// Segredo do link de cancelamento do cliente. Separado do `id` de
+  /// propósito: a página de confirmação pode ser compartilhada ou printada
+  /// sem que quem a veja ganhe poder de cancelar.
+  cancelToken String @unique @default(uuid())
+
+  /// Quando o lembrete pré-visita foi enviado. Nulo = ainda não; o cron só
+  /// pega reservas com este campo nulo, então nunca lembra duas vezes.
+  reminderSentAt DateTime? @db.Timestamptz(3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Consulta quente: soma de ocupação sobreposta.
+  @@index([startTime, endTime])
+  @@index([serviceDate])
+  @@index([status])
+  @@map("reservations")
+}
+
+/// Papel: preenche as permissões de uma vez no cadastro e rotula a pessoa na
+/// lista. Quem manda de verdade são as linhas de UserModulePermission — se
+/// alguém ajustar à mão, a tela mostra "Gerente (ajustado)".
+/// Os papéis da casa, por função de verdade — não por nível de acesso.
+///
+/// "OPERACAO" era genérico demais: quem está no caixa e quem cuida do
+/// dinheiro precisam de telas diferentes, não de graus diferentes da mesma
+/// permissão. O papel é só o atalho de cadastro; o que vale é a linha em
+/// UserModulePermission, ajustável pessoa por pessoa.
+enum UserRole {
+  DONO
+  GERENTE
+  CAIXA
+  FINANCEIRO
+  /// Conta o estoque e recebe mercadoria: só Compras, sem configurar.
+  ESTOQUISTA
+}
+
+model AdminUser {
+  id            Int       @id @default(autoincrement())
+  username      String    @unique
+  passwordHash  String
+  /// Nome de gente, para a lista não mostrar só login.
+  name          String?
+  /// Nasce no papel mais restrito: conta criada sem escolha explícita não
+  /// deve sair podendo mais do que o mínimo.
+  role          UserRole  @default(CAIXA)
+  /// Desligado não entra: conferido no login e a cada tela.
+  isActive      Boolean   @default(true)
+  /// Superusuário: entra e configura tudo, sempre, sem depender das
+  /// permissões por módulo (inclusive módulo criado depois). A tela de
+  /// Usuários não o desativa, não o rebaixa e não mexe nas permissões dele.
+  superusuario  Boolean   @default(false)
+  lastLoginAt   DateTime?
+  /// O que a pessoa escolheu ver na página inicial, na ordem:
+  /// { numeros: string[], atalhos: string[] }. Nulo = o padrão.
+  paginaInicial Json?
+  /// O e-mail da pessoa, para os avisos que ela escolher receber por e-mail.
+  email         String?
+  /// Os avisos que ela escolheu e por onde: { [evento]: { celular, email } }.
+  /// Nulo = o padrão (celular ligado, e-mail desligado). Ver `lib/notificacoes.ts`.
+  notificacoes  Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  permissions UserModulePermission[]
+
+  /// Financeiro: quem lançou e quem deu baixa. É a primeira pergunta quando
+  /// um número não bate.
+  lancamentosCriados  Lancamento[]       @relation("lancamentoCriadoPor")
+  lancamentosBaixados Lancamento[]       @relation("lancamentoBaixadoPor")
+  fechamentosDoDia    FechamentoDoDia[]
+  transferencias      Transferencia[]
+  anexosFinanceiros   AnexoFinanceiro[]
+  extratosImportados  ExtratoImportado[]
+  mesesFechados       MesFechado[]
+
+  /// Contagens de estoque pedidas a esta pessoa.
+  contagens Contagem[]
+
+  /// Listas de compra fixas que esta pessoa costuma contar.
+  listasCompra ListaCompra[]
+
+  /// Ideais de Requisição sugeridos pelo estoquista que esta pessoa decidiu.
+  idealSugeridoDecidido SugestaoIdealRequisicao[] @relation("idealSugeridoDecididoPor")
+
+  /// Produtos novos que esta pessoa autorizou ou recusou.
+  produtosNovosDecididos ContagemProdutoNovo[]
+
+  /// Correções de cadastro que esta pessoa autorizou ou recusou.
+  correcoesDecididas ContagemProdutoCorrecao[] @relation("correcaoDecididaPor")
+  correcoesSugeridas ContagemProdutoCorrecao[] @relation("correcaoSugeridaPor")
+
+  /// O mesmo, para o que um fornecedor ofereceu por conta própria na cotação.
+  ofertasNovasDecididas CotacaoProdutoNovo[]
+
+  divergenciasResolvidas PedidoCompra[]       @relation("divergenciaResolvidaPor")
+  creditosAbatidos       PedidoCompra[]       @relation("creditoAbatidoPor")
+  avaliacoesFeitas       AvaliacaoQualidade[]
+
+  /// Os celulares (e computadores) desta pessoa que recebem os avisos.
+  celulares CelularDeAviso[]
+
+  /// Os tokens que ela criou para o Claude consultar o app (MCP).
+  tokensDeAcesso TokenDeAcesso[]
+
+  /// Onde esta pessoa trabalha. Opcional porque o cadastro de setores nasce
+  /// vazio, e porque parceiro externo e o próprio dono não pertencem a um.
+  setorId Int?
+  setor   Setor? @relation("SetorDaPessoa", fields: [setorId], references: [id], onDelete: SetNull)
+
+  // --- Módulo Tarefas ----------------------------------------------------
+  //
+  // Todas com `onDelete: Restrict` do outro lado, menos a de membro: pessoa
+  // que tem histórico não pode ser apagada, e é por isso que desligar alguém
+  // é `isActive = false`. O nome de quem fez continua legível no log anos
+  // depois, que é o que RN-037 e o prazo de guarda do PRD exigem.
+  setoresQueLidera Setor[]         @relation("SetorLider")
+  projetosQueDona  Projeto[]       @relation("ProjetoDono")
+  projetosMembro   MembroProjeto[]
+
+  tarefasResponsavel Tarefa[] @relation("TarefaResponsavel")
+  tarefasCriadas     Tarefa[] @relation("TarefaCriador")
+  tarefasAtualizadas Tarefa[] @relation("TarefaAtualizador")
+  tarefasConcluidas  Tarefa[] @relation("TarefaConclusor")
+  tarefasExcluidas   Tarefa[] @relation("TarefaExcluidor")
+
+  movimentosFeitos MovimentoColuna[] @relation("MovimentoAutor")
+  acoesNoLog       LogAtividade[]    @relation("LogAutor")
+  comentarios      Comentario[]      @relation("ComentarioAutor")
+  anexosDeTarefa   AnexoTarefa[]     @relation("AnexoTarefaAutor")
+  etiquetasCriadas Etiqueta[]        @relation("EtiquetaAutor")
+
+  sugestoesBuffetCriadas   SugestaoBuffet[] @relation("sugestaoBuffetCriadaPor")
+  sugestoesBuffetDecididas SugestaoBuffet[] @relation("sugestaoBuffetDecididaPor")
+  treinamentosRegistrados  Treinamento[]    @relation("treinamentoRegistradoPor")
+
+  @@index([setorId])
+  @@map("admin_users")
+}
+
+/// Um aparelho que aceitou receber os avisos de Compras como notificação.
+///
+/// É o que o navegador entrega quando a pessoa toca em "Avisar neste
+/// celular": um endereço do serviço de notificações dele (`endpoint`) e as
+/// duas chaves para cifrar a mensagem. Uma pessoa pode ter vários; o mesmo
+/// aparelho reinscrito atualiza a linha, pelo `endpoint`.
+///
+/// Cascade: conta apagada não tem mais para quem avisar. Conta desativada
+/// fica com a linha, mas o envio filtra por `isActive`.
+model CelularDeAviso {
+  id     Int       @id @default(autoincrement())
+  userId Int
+  user   AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  endpoint String @unique
+  p256dh   String
+  auth     String
+
+  /// O navegador que se inscreveu, só para a pessoa reconhecer o aparelho.
+  aparelho String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("celulares_de_aviso")
+}
+
+/// Quem entra em qual módulo. `moduleSlug` casa com o slug de lib/modules.ts —
+/// texto livre de propósito: o registro de módulos vive no código, e um enum
+/// aqui obrigaria uma migração a cada módulo novo.
+///
+/// `enabled` em lib/modules.ts é outro eixo: significa "pronto para uso", não
+/// "permitido". O módulo aparece quando os dois são verdadeiros.
+model UserModulePermission {
+  id     Int       @id @default(autoincrement())
+  userId Int
+  user   AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  moduleSlug   String
+  /// Sem isto a pessoa opera o módulo mas não mexe nas configurações dele —
+  /// garçom anota reserva, não muda a lotação do salão.
+  canConfigure Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, moduleSlug])
+  @@map("user_module_permissions")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Compras — cadastros que alimentam a cotação
+// ---------------------------------------------------------------------------
+
+/// Unidade de compra. Lista fechada de propósito: em texto livre o mesmo item
+/// viraria "kg", "Kg" e "quilo" no banco, e comparar preço entre fornecedores
+/// deixaria de ser possível.
+enum ProductUnit {
+  UN
+  KG
+  G
+  L
+  ML
+  CX
+  PCT
+  MACO
+  DZ
+  FD
+}
+
+/// Como a casa organiza a compra. Serve para agrupar a lista quando ela
+/// crescer — ninguém percorre duzentos itens em ordem alfabética.
+///
+/// Era lista fechada no código. Virou cadastro porque cada casa divide a
+/// compra do seu jeito, e "peixe" ou "panificação" não cabiam num enum que
+/// só muda com migração. A unidade continua fechada, e é diferente de
+/// propósito: quilo é quilo em qualquer restaurante, e comparar preço entre
+/// fornecedores depende disso.
+///
+/// Pode ser apagada, ao contrário de produto e fornecedor. Categoria é
+/// rótulo, não histórico — a cotação referencia o item e de quem é o preço,
+/// nunca a gaveta em que ele estava. Quem apaga deixa os produtos sem
+/// categoria, não sem preço.
+model Category {
+  id   Int    @id @default(autoincrement())
+  name String @unique
+
+  /// A ordem em que a lista de compras sai. Sem isto ela sairia alfabética,
+  /// e ninguém percorre o mercado em ordem alfabética.
+  sortOrder Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  products  Product[]
+  suppliers SupplierCategory[]
+
+  /// Produtos novos que o estoquista disse ter achado nesta gaveta.
+  produtosNovos ContagemProdutoNovo[]
+
+  /// Correções que propõem mover um produto para esta gaveta.
+  correcoesPropostas ContagemProdutoCorrecao[]
+
+  @@map("categories")
+}
+
+model Supplier {
+  id   Int    @id @default(autoincrement())
+  name String
+
+  /// Como a CASA chama ele. "Himalaia", e não "Himalaia Com. de Prod.
+  /// Alimentares Ltda".
+  ///
+  /// `name` é a razão social e continua sendo: é o que vai na nota e no CNPJ.
+  /// Este é o nome de uso, e existe porque as telas de compra põem fornecedor
+  /// em cabeçalho de coluna de 96px — ali a razão social vira reticências, e
+  /// reconhecer quem é custa três segundos por coluna.
+  ///
+  /// Nulo é o normal e quer dizer "use a razão social". Quem tem nome curto
+  /// nunca vai precisar de apelido.
+  ///
+  /// Onde aparece cada um é decisão de tela, e a regra é: quem está COMPRANDO
+  /// vê o apelido; quem está mexendo no CADASTRO vê a razão social, senão não
+  /// tem como conferir se é a empresa certa.
+  apelido String? @db.VarChar(40)
+
+  /// A pessoa com quem se fala, que raramente é o nome da empresa.
+  contactName  String?
+  /// E.164, mesma normalização do telefone de cliente — é por aqui que o
+  /// pedido de cotação sai no WhatsApp.
+  phone        String?
+  email        String?
+  /// CNPJ, só dígitos.
+  taxId        String?
+  address      String?
+  /// Prazo de entrega em dias. Junto do preço é o que decide a compra.
+  deliveryDays Int?
+
+  /// Em que dias da semana ele entrega: "sexta-feira", "segunda a sexta".
+  ///
+  /// Texto, e não um conjunto de dias, porque o que o fornecedor promete
+  /// raramente é uma lista fechada — "quarta ou sexta", "praticamente todos
+  /// os dias", "a combinar". Transformar isso em caixinhas obrigaria quem
+  /// cadastra a mentir para caber, e é informação que o comprador lê, não
+  /// que o sistema calcula.
+  deliveryWeekdays String?
+
+  /// Prazo de pagamento como o fornecedor fala: "14", "7,14,21,28", "à vista".
+  ///
+  /// Mesma razão do campo acima. Um dia isso pode virar número comparável,
+  /// mas só depois que a casa padronizar o que negocia — inventar o padrão
+  /// aqui apagaria o que foi combinado de verdade.
+  paymentTerms String?
+
+  /// Pedido mínimo em reais. Abaixo disso ele não entrega.
+  minOrder Decimal? @db.Decimal(10, 2)
+
+  notes String?
+
+  /// O que este fornecedor atende. É o que permite a cotação perguntar
+  /// preço de hortifrúti só a quem vende hortifrúti.
+  categories SupplierCategory[]
+
+  /// Itens que este fornecedor vende, item a item.
+  ///
+  /// Convive com a categoria em vez de substituí-la: a categoria é a rede
+  /// larga, que já responde "quem vende hortifrúti"; este vínculo é o ajuste
+  /// fino, para o item que só um fornecedor tem, ou para o que ele não vende
+  /// apesar da categoria dizer que sim.
+  products ProductSupplier[]
+
+  /// Produtos que só ele pode vender — a sugestão de compra deles nunca
+  /// entra em cotação, vira pedido direto.
+  produtosExclusivos Product[]     @relation("produtoExclusivo")
+  bonificacoes       Bonificacao[]
+
+  /// Cotações que este fornecedor respondeu.
+  cotacaoFornecedores CotacaoFornecedor[] @relation("cotacaoFornecedores")
+
+  /// Pedidos de compra gerados pra este fornecedor.
+  pedidosCompra PedidoCompra[] @relation("pedidosCompra")
+
+  /// As listas fixas dele — uma por dia da semana em que ele recebe pedido.
+  listasCompra ListaCompra[]
+
+  /// Histórico de preços que ele cobrou.
+  historico HistoricoPrecosCompra[] @relation("historico")
+
+  /// O que ele fez e a casa precisa saber: respondeu, faltou, entregou.
+  avisos AvisoCompra[]
+
+  /// As notas de qualidade das entregas dele.
+  avaliacoes AvaliacaoQualidade[]
+
+  /// Nasceu de convite preenchido pelo próprio fornecedor, não digitado aqui.
+  /// Registrado porque explica o dado torto: quem preenche de fora escreve
+  /// em caixa alta, erra CNPJ, e é bom saber de onde veio.
+  selfRegistered Boolean @default(false)
+
+  /// Atacado: a casa vai buscar. Os exclusivos dele viram "Compra no
+  /// atacado" — lista com o valor estimado pela última compra, sem link para
+  /// ninguém digitar preço; o preço de verdade entra ao receber, pela nota.
+  compraNoAtacado Boolean @default(false)
+
+  /// As contas a pagar dele no Financeiro, e as que se repetem todo mês.
+  lancamentos  Lancamento[]
+  recorrencias Recorrencia[]
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+  @@map("suppliers")
+}
+
+/// Convite para o fornecedor preencher o próprio cadastro.
+///
+/// Serve uma vez e vence. O segredo é o token, separado do id — mesma razão
+/// do link de cancelamento da reserva: um endereço sequencial seria
+/// adivinhável, e esta é porta de escrita sem login.
+model SupplierInvite {
+  id    Int    @id @default(autoincrement())
+  token String @unique @default(uuid())
+
+  /// Para você saber de quem é o convite antes de ele virar cadastro.
+  label String?
+
+  /// Nulo enquanto não foi preenchido. Preenchido, o convite morre.
+  usedAt     DateTime?
+  /// Fornecedor que nasceu deste convite.
+  supplierId Int?
+
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([usedAt])
+  @@map("supplier_invites")
+}
+
+model Product {
+  id Int @id @default(autoincrement())
+
+  /// Código interno da casa. Opcional — nem todo restaurante usa — mas único
+  /// quando existe: dois itens com o mesmo código é erro de cadastro, e o
+  /// banco recusa em vez de deixar a cotação escolher o errado.
+  code String? @unique
+
+  /// O nome do item, como aparece na nota do fornecedor. É o que a grade
+  /// mostra e o que a busca percorre.
+  name String
+
+  /// Os detalhes que não cabem no nome: calibre, o corte exato, como a casa
+  /// usa o item. Fica fora da grade de propósito — é texto longo, lido na
+  /// hora de comprar, não de percorrer a lista.
+  description String?
+
+  /// As marcas que servem para a casa. Vazio = tanto faz.
+  ///
+  /// Lista, e não um nome só: quase todo item aceita duas ou três marcas, e
+  /// escrever "Sadia ou Perdigão" num campo de texto fazia a informação
+  /// existir para quem lia e não existir para o sistema. Em lista, ela vira
+  /// o que o fornecedor escolhe na hora de dar o preço.
+  ///
+  /// Array de texto, como `Contagem.categoryIds`: é um recorte do cadastro
+  /// do produto, não uma entidade que alguém vai querer listar ou renomear
+  /// em outro lugar.
+  preferredBrands String[]
+
+  /// Se serve uma equivalente quando nenhuma das preferidas tem.
+  ///
+  /// Nasce `false` de propósito: o silêncio de um cadastro que ninguém
+  /// preencheu não pode virar permissão para trocar a marca. Quem aceita
+  /// similar diz que aceita.
+  acceptsSimilarBrand Boolean @default(false)
+
+  /// Produto escolhido para ter a qualidade avaliada: quem recebe dá de 1 a 5
+  /// estrelas em cada entrega, e o dono também. É o que mostra, com o tempo,
+  /// qual marca e qual fornecedor entregam melhor.
+  avaliarQualidade Boolean              @default(false)
+  /// Os insumos do Receituário que tiram o preço deste produto.
+  insumosDeReceita InsumoReceita[]
+  /// Como os itens das notas de mercado viram este produto (`VinculoNota`).
+  vinculosNota     VinculoNota[]
+  avaliacoes       AvaliacaoQualidade[]
+  bonificacoes     Bonificacao[]
+
+  /// O que o produto tem que ser, e o que a casa prefere: `[{ texto:
+  /// "Resfriado", obrigatoria: true }]`. Formato em `lib/especificacao.ts`.
+  ///
+  /// Obrigatória: o fornecedor precisa confirmar "sim" no link para o preço
+  /// valer. Preferência: ele responde sim ou não, e a resposta só informa.
+  /// Diferente de `description`, que é texto para ler: isto é pergunta que
+  /// ele tem de responder.
+  especificacoes Json @default("[]")
+
+  unit ProductUnit
+
+  /// Uma categoria por item, e ela pode faltar.
+  ///
+  /// Nulo é estado honesto: item recém-importado que ainda não foi guardado
+  /// em lugar nenhum aparece como "sem categoria" e pede arrumação, em vez de
+  /// se esconder num "Outros" que ninguém revisa.
+  categoryId Int?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  /// Quem vende este item. É a lista que a cotação vai percorrer.
+  ///
+  /// Não se aplica quando `exclusiveSupplierId` está preenchido: aí só um
+  /// pode vender, e esta lista fica vazia — o vínculo largo não faz sentido
+  /// ao lado de um único fornecedor obrigatório.
+  suppliers ProductSupplier[]
+
+  /// A quem este produto pertence, e mais ninguém. Nulo é o normal — a
+  /// sugestão de compra entra em cotação, comparando fornecedores. Marcado,
+  /// ela pula a cotação e vira pedido direto para ele, com o preço que ele
+  /// mesmo confirma pelo link.
+  exclusiveSupplierId Int?
+  exclusiveSupplier   Supplier? @relation("produtoExclusivo", fields: [exclusiveSupplierId], references: [id], onDelete: SetNull)
+
+  /// Contagens deste item em rodadas de cotação.
+  contagensItens ContagemItem[]
+
+  /// Listas de compra fixas em que este produto entra.
+  listasCompra ListaCompraItem[]
+
+  /// Ideais de Requisição sugeridos pelo estoquista para este produto.
+  idealSugerido SugestaoIdealRequisicao[]
+
+  /// A sugestão de produto novo que virou este cadastro, quando ele nasceu
+  /// assim. Lista e não campo único: nada impede que duas contagens sugiram
+  /// a mesma coisa e o dono aponte as duas para o mesmo produto.
+  sugestoesQueViraram ContagemProdutoNovo[]
+
+  /// O que o estoquista disse estar errado no cadastro deste produto.
+  correcoesSugeridas ContagemProdutoCorrecao[]
+
+  /// O mesmo, vindo da oferta de um fornecedor em vez da prateleira.
+  ofertasQueViraram CotacaoProdutoNovo[]
+
+  /// Itens desta rodada de cotação que incluem este produto.
+  cotacaoItens CotacaoItem[]
+
+  /// Itens dos pedidos de compra que incluem este produto.
+  pedidosCompraItens PedidoCompraItem[]
+
+  /// Histórico de preços que este produto teve.
+  historico HistoricoPrecosCompra[] @relation("historico")
+
+  /// Quanto tem hoje, por contagem. É número solto de propósito: enquanto
+  /// não houver entrada de compra nem baixa por venda, movimento seria
+  /// máquina sem nada para mover. Quando as compras começarem a chegar,
+  /// este campo vira derivado e a contagem passa a ser um ajuste.
+  currentStock Decimal @default(0) @db.Decimal(10, 3)
+
+  /// Abaixo disto, precisa comprar. Decimal porque insumo se mede em 2,5 kg.
+  minStock   Decimal? @db.Decimal(10, 3)
+  /// Quanto ter depois de comprar. A diferença para o mínimo é a sugestão.
+  idealStock Decimal? @db.Decimal(10, 3)
+
+  /// De quanto em quanto a casa compra este item. Nulo = qualquer número serve.
+  ///
+  /// A água vem em fardo de 12: pedir 13 é pedir uma compra que não existe. A
+  /// sugestão arredonda para o lote MAIS PERTO, e não para cima — faltando 13
+  /// de um lote de 12 ela pede 12, e faltando 19 pede 24. Faltando menos de
+  /// meio lote ela não pede nada: comprar um fardo inteiro para repor cinco
+  /// garrafas é encher a prateleira do que a casa não quer ter.
+  ///
+  /// NÃO é a embalagem do fornecedor (`Preco.embalagem` e `Preco.conteudo`).
+  /// Aquilo é como ELE vende, muda de fornecedor para fornecedor e é declarado
+  /// a cada rodada; isto é como a CASA compra, vale para qualquer um e é
+  /// cadastro. A sugestão nasce antes de qualquer fornecedor responder, então
+  /// ela não teria de onde ler a outra.
+  ///
+  /// Cuidado com lote maior que o dobro do ideal: a falta nunca passa do
+  /// ideal, então o item nunca chega a meio lote e nunca entra na compra. O
+  /// cadastro fica certo e o produto fica invisível.
+  ///
+  /// Decimal como os outros três, e pela mesma razão: tem casa que compra
+  /// tempero em pote de 0,5 kg.
+  lotSize Decimal? @db.Decimal(10, 3)
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([categoryId])
+  @@index([isActive])
+  @@index([exclusiveSupplierId])
+  @@map("products")
+}
+
+/// O que cada fornecedor atende, por categoria.
+///
+/// Tabela de ligação escrita à mão em vez de relação implícita do Prisma: o
+/// resto do schema nomeia as tabelas em snake_case, e uma `_CategoryToSupplier`
+/// no meio delas seria a única que ninguém sabe de onde veio ao abrir o banco.
+model SupplierCategory {
+  supplierId Int
+  supplier   Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  categoryId Int
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([supplierId, categoryId])
+  @@index([categoryId])
+  @@map("supplier_categories")
+}
+
+/// Quem vende cada item.
+///
+/// Cascade nos dois lados é rede de segurança, não rotina: produto e
+/// fornecedor são desativados, nunca apagados. Se algum dia um deles sumir de
+/// verdade, o vínculo some junto em vez de virar linha órfã apontando para
+/// um id que não existe mais.
+model ProductSupplier {
+  productId  Int
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  supplierId Int
+  supplier   Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@id([productId, supplierId])
+  @@index([supplierId])
+  @@map("product_suppliers")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Compras — cotação
+// ---------------------------------------------------------------------------
+
+enum CotacaoStatus {
+  CONTANDO
+  ABERTA
+  RESPONDENDO
+  FECHADA
+  APROVADA
+  /// Descartada pelo dono antes de gerar pedidos: não vira compra.
+  DESCARTADA
+}
+
+/// Por que um item veio menos (ou não veio) no recebimento.
+enum ProblemaRecebimento {
+  FALTA
+  DEVOLVIDO
+  AVARIA
+}
+
+/// O que foi feito com a diferença entre o combinado e o que chegou.
+enum DesfechoDivergencia {
+  /// A diferença foi cobrada do fornecedor.
+  COBRADO
+  /// Vai abatida no próximo pedido.
+  CREDITO
+  /// Ficou como veio.
+  ACEITO
+}
+
+/// Por que a mercadoria chegou sem pedido nenhum.
+enum MotivoSemPedido {
+  /// Veio de brinde, sem custo.
+  BONIFICACAO
+  /// Reposição de algo devolvido antes — já estava pago.
+  TROCA
+  /// Comprado na hora, no balcão ou pela porta; tem nota e preço.
+  BALCAO
+}
+
+enum PedidoCompraStatus {
+  /// Pedido direto: nasceu, o link foi para o fornecedor, falta ele
+  /// confirmar o preço de cada item.
+  AGUARDANDO_FORNECEDOR
+  CRIADO
+  ENVIADO
+  ENTREGUE
+  PARCIAL_ENTREGUE
+  CANCELADO
+}
+
+enum CotacaoFornecedorStatus {
+  ENVIADA
+  RESPONDIDA
+  RECUSADA
+  EXPIRADA
+}
+
+/// O que o fornecedor respondeu sobre um item.
+///
+/// Antes disto, "não tenho" era o campo de preço em branco — e branco é
+/// igualzinho a "pulei essa linha sem querer". A casa lia célula vazia como
+/// silêncio e ficava esperando resposta que já tinha vindo.
+enum PrecoStatus {
+  OFERTADO
+  SEM_ESTOQUE
+  NAO_TRABALHA
+}
+
+/// Uma rodada de cotação — do momento que você conta até aprovar quem vence.
+model Cotacao {
+  id Int @id @default(autoincrement())
+
+  avisos             AvisoCompra[]
+  /// Correções de cadastro sugeridas a partir desta cotação.
+  correcoesDeProduto ContagemProdutoCorrecao[]
+
+  /// Estágio da cotação: contando estoque, esperando respostas, comparando, etc.
+  estatus CotacaoStatus @default(CONTANDO)
+
+  /// As contagens de estoque que viraram esta cotação.
+  ///
+  /// Lista, e não uma só: quem contou a despensa em duas voltas — bebidas na
+  /// segunda, secos na quarta — junta as duas numa rodada de compra só, em vez
+  /// de mandar duas cotações ao mesmo fornecedor na mesma semana.
+  contagens Contagem[]
+
+  /// Os produtos a cotar, com as sugestões de compra.
+  cotacaoItens CotacaoItem[]
+
+  /// As respostas dos fornecedores.
+  cotacaoFornecedores CotacaoFornecedor[]
+
+  /// Os pedidos gerados após aprovação.
+  pedidosCompra PedidoCompra[]
+  bonificacoes  Bonificacao[]
+
+  /// O que a casa NÃO compra e quer saber se dá para comprar.
+  pesquisaItens PesquisaPreco[]
+
+  dataInicio DateTime @default(now())
+
+  /// Quando você aprovou e gerou os pedidos.
+  dataFechamento DateTime?
+
+  /// Até quando o fornecedor pode responder. O link mostra a data e o tempo
+  /// que falta, e depois dela fecha — página e envio. Nulo = sem prazo, o
+  /// link fica aberto até a cotação ser fechada.
+  prazoResposta DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([estatus])
+  @@map("cotacoes")
+}
+
+/// Contagem de estoque físico que você fez. Um ponto no tempo de quando você
+/// contou cada item.
+model Contagem {
+  id Int @id @default(autoincrement())
+
+  /// A rodada de cotação que nasceu desta contagem. Nula até alguém montá-la.
+  ///
+  /// Era obrigatória: contar era o primeiro passo DENTRO da cotação, e as duas
+  /// nasciam juntas. Contar passou a vir antes — quem conta é o estoquista,
+  /// pelo celular, e quem decide comprar é outra pessoa, depois. Uma contagem
+  /// pode não virar compra nenhuma, e isso é um resultado legítimo.
+  ///
+  /// E era única, o que obrigava uma cotação por contagem. Quem contou a
+  /// despensa em duas voltas — bebidas na segunda, secos na quarta — era
+  /// obrigado a mandar duas cotações ao mesmo fornecedor, na mesma semana. Sem
+  /// a unicidade, várias contagens apontam para a mesma rodada de compra.
+  ///
+  /// O índice continua, sem o `unique`: é por ele que a tela de contagens
+  /// descobre o que já virou compra.
+  cotacaoId Int?
+  cotacao   Cotacao? @relation(fields: [cotacaoId], references: [id], onDelete: Cascade)
+
+  /// Os pedidos diretos que nasceram desta contagem — um por fornecedor
+  /// exclusivo com sugestão de compra nela. Nem toda contagem gera um: a
+  /// maioria vai inteira para `cotacao`, e a lista fica vazia.
+  pedidosCompraDiretos PedidoCompra[]
+
+  /// Ideais de Requisição que o estoquista sugeriu nesta contagem.
+  idealSugerido SugestaoIdealRequisicao[]
+
+  /// O segredo do link do estoquista. Separado do `id` pela mesma razão do
+  /// link de cancelamento da reserva e do link da cotação: um endereço
+  /// sequencial seria adivinhável, e esta é porta de escrita sem login.
+  token String @unique
+
+  /// Quando o link para de abrir. Escolhido por quem inicia a contagem —
+  /// 12 horas é só o padrão sugerido. Sem prazo, um link vazado abriria para
+  /// sempre; com prazo curto demais, o estoquista perde a contagem no meio.
+  expiresAt DateTime
+
+  /// Cancelada pelo dono: o link fecha de vez. Diferente de vencida, que o
+  /// estoquista pode reabrir escolhendo um novo prazo. Nulo = não cancelada.
+  canceladaEm DateTime?
+
+  /// O que a finalização disse a quem contou: os pedidos das compras de
+  /// rotina que saíram dela ("Pedido #23 para Hortifruti pronto…"). A tela
+  /// de contagem finalizada mostra, porque recarrega e perde a resposta.
+  recado String?
+
+  /// A quem a casa pediu esta contagem.
+  ///
+  /// Registro, não credencial: ele conta pelo link, sem senha, e quem abre a
+  /// porta é o token. Serve para a lista dizer de quem é cada contagem, e
+  /// para cobrar quem ficou de fazer.
+  ///
+  ///  porque apagar uma conta não pode levar junto o histórico de
+  /// uma contagem que aconteceu.
+  responsavelId Int?
+  responsavel   AdminUser? @relation(fields: [responsavelId], references: [id], onDelete: SetNull)
+
+  /// Quais categorias esta contagem cobre.
+  ///
+  /// Lista de ids, e não uma tabela de ligação: é um recorte congelado do
+  /// momento em que a contagem começou, não um vínculo que evolui. Se a
+  /// categoria for apagada depois, o id órfão aqui é história, não erro.
+  categoryIds Int[]
+
+  /// A lista fixa de onde esta contagem saiu, quando saiu de uma. É o que
+  /// faz o pedido nascer sozinho ao finalizar, e para qual fornecedor.
+  listaCompraId Int?
+  listaCompra   ListaCompra? @relation(fields: [listaCompraId], references: [id], onDelete: SetNull)
+
+  itens ContagemItem[]
+
+  /// O que o estoquista achou na prateleira e não estava no cadastro.
+  ///
+  /// Fora de `itens` de propósito: `ContagemItem` aponta para um produto que
+  /// existe, e estes ainda não existem. Enquanto o dono não autorizar, são
+  /// uma afirmação sobre a prateleira, não uma linha do catálogo.
+  produtosNovos ContagemProdutoNovo[]
+
+  /// O que ele viu de errado no cadastro enquanto contava.
+  correcoes ContagemProdutoCorrecao[]
+
+  dataContagem DateTime @default(now())
+
+  /// O estoquista terminou e fechou o link. É o que separa "está contando" de
+  /// "pode virar lista de compra" — e o que faz o link parar de abrir antes
+  /// mesmo de o prazo vencer.
+  concluida Boolean @default(false)
+
+  /// Quando esta contagem virou compra. É o que diz "já gasta" de uma vez só,
+  /// sem depender do que nasceu dela: com um pedido por fornecedor, duas
+  /// contagens juntas podem gerar um pedido amarrado só à mais nova, e a
+  /// outra ficaria sem cotação e sem pedido — pronta para virar compra de
+  /// novo. Nula nas contagens de antes; para elas continuam valendo
+  /// `cotacaoId` e `pedidosCompraDiretos`.
+  processadaEm DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cotacaoId])
+  @@index([processadaEm])
+  /// Os relatórios filtram as contagens concluídas por data.
+  @@index([concluida, dataContagem])
+  @@map("contagens")
+}
+
+/// Um item contado — um produto específico com a quantidade que você viu.
+model ContagemItem {
+  id Int @id @default(autoincrement())
+
+  contagemId Int
+  contagem   Contagem @relation(fields: [contagemId], references: [id], onDelete: Cascade)
+
+  produtoId Int
+  produto   Product @relation(fields: [produtoId], references: [id], onDelete: Cascade)
+
+  /// O que o estoquista contou na prateleira. Nulo enquanto ele não passou por
+  /// este item — e nulo é diferente de zero: zero é "acabou", nulo é "não
+  /// olhei". Item não olhado não mexe no estoque nem entra na sugestão.
+  quantidadeContada Decimal? @db.Decimal(10, 3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([contagemId, produtoId])
+  /// "Contado hoje" da Requisição: produto e data da última contagem.
+  @@index([produtoId, updatedAt])
+  @@map("contagem_itens")
+}
+
+enum ProdutoNovoStatus {
+  PENDENTE
+  APROVADO
+  RECUSADO
+}
+
+/// Um produto que estava na prateleira e não estava no cadastro.
+///
+/// Tabela de espera, e não um `Product` marcado como pendente. Produto meio
+/// aprovado vazaria para a cotação, para o pedido, para a exportação e para a
+/// contagem seguinte, e `Product.name` não tem índice único — o lixo se
+/// acumularia na tabela de verdade. Aqui ele fica de fora até alguém dizer
+/// que ele existe.
+///
+/// A quantidade viaja junto porque é o motivo de o estoquista ter parado para
+/// digitar: ele contou aquilo. Ela só vira estoque quando o produto nasce, na
+/// autorização — a contagem já pode ter fechado até lá, e fechar não escreve
+/// estoque de produto que não existe.
+model ContagemProdutoNovo {
+  id Int @id @default(autoincrement())
+
+  contagemId Int
+  contagem   Contagem @relation(fields: [contagemId], references: [id], onDelete: Cascade)
+
+  /// O que ele escreveu. Vira `Product.name` na autorização, depois de o dono
+  /// poder corrigir — "tomate ital." não é nome de cadastro.
+  nome String
+
+  unit ProductUnit
+
+  /// Em que gaveta ele diz ter achado. Nula quando ele não soube dizer, e
+  /// nula também quando a categoria for apagada depois: sugestão sem gaveta
+  /// ainda é uma sugestão.
+  categoryId Int?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  quantidade Decimal @db.Decimal(10, 3)
+
+  status ProdutoNovoStatus @default(PENDENTE)
+
+  /// O cadastro que nasceu daqui. Nulo enquanto ninguém autorizou — e volta a
+  /// ser nulo se o produto for apagado, porque a sugestão continua sendo
+  /// história de que alguém achou aquilo na prateleira.
+  produtoId Int?
+  produto   Product? @relation(fields: [produtoId], references: [id], onDelete: SetNull)
+
+  /// Quem decidiu e quando. Recusada não é apagada: o que o estoquista
+  /// digitou é trabalho dele, e some junto se a linha for embora — a mesma
+  /// escolha de `cancelarContagem`.
+  decididoEm    DateTime?
+  decididoPorId Int?
+  decididoPor   AdminUser? @relation(fields: [decididoPorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([contagemId])
+  @@index([status])
+  @@map("contagem_produtos_novos")
+}
+
+/// O que o estoquista viu de errado no cadastro, com a prateleira na mão.
+///
+/// Irmão de `ContagemProdutoNovo` e o oposto dele: lá o produto não existe,
+/// aqui existe e está descrito errado — "Coca-cola 350ml" que na prateleira é
+/// de 310, item em `un` que se compra em `kg`, coisa guardada na gaveta que
+/// não é a dela. Quem conta é quem vê, e antes disto não tinha como avisar
+/// sem sair da contagem.
+///
+/// Os três campos guardam a PROPOSTA inteira, e não só o que mudou. O
+/// formulário nasce preenchido com o cadastro de hoje, então gravar tudo custa
+/// o mesmo e evita a ambiguidade que um campo nulo traria: em `categoryId`,
+/// nulo seria ao mesmo tempo "não mexi" e "tire da gaveta". A tela de
+/// aprovação compara com o cadastro na hora de mostrar, e por isso mostra a
+/// diferença contra o que o produto é AGORA, não contra o que era quando ele
+/// sugeriu.
+///
+/// Reaproveita `ProdutoNovoStatus`: pendente, aprovado e recusado servem aos
+/// dois, e um enum gêmeo só para trocar o nome seria mais uma migração para
+/// dizer a mesma coisa.
+model ContagemProdutoCorrecao {
+  id Int @id @default(autoincrement())
+
+  /// A contagem onde o estoquista sugeriu. Nula quando a sugestão veio da
+  /// cotação — quem compra também acha nome errado e unidade trocada.
+  contagemId Int?
+  contagem   Contagem? @relation(fields: [contagemId], references: [id], onDelete: Cascade)
+
+  /// A cotação onde a correção foi sugerida, quando veio de lá.
+  cotacaoId Int?
+  cotacao   Cotacao? @relation(fields: [cotacaoId], references: [id], onDelete: SetNull)
+
+  /// Quem sugeriu, quando tem conta (na contagem é o link, sem login).
+  sugeridoPorId Int?
+  sugeridoPor   AdminUser? @relation("correcaoSugeridaPor", fields: [sugeridoPorId], references: [id], onDelete: SetNull)
+
+  produtoId Int
+  produto   Product @relation(fields: [produtoId], references: [id], onDelete: Cascade)
+
+  /// O nome como ele acha que deveria estar.
+  nome String
+
+  /// A unidade como ele acha que deveria estar.
+  unit ProductUnit
+
+  /// A gaveta proposta. Nulo aqui é "sem categoria", e não "não mexi".
+  categoryId Int?
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  /// O que ele quis dizer e os campos não cabem: "a embalagem mudou", "tem
+  /// dois iguais no cadastro". É a saída de quem sabe que está errado e não
+  /// sabe o certo.
+  observacoes String?
+
+  /// Estoque ideal e lote de compra novos, quando a correção mexe neles
+  /// (vem da cotação). Nulo = não mexe — não há como apagar por aqui.
+  idealStock Decimal? @db.Decimal(10, 3)
+  lotSize    Decimal? @db.Decimal(10, 3)
+
+  /// O estoquista pediu para desativar o produto ("não usamos mais").
+  /// Aceito, o produto sai do cadastro ativo e das próximas contagens.
+  desativar Boolean @default(false)
+
+  status ProdutoNovoStatus @default(PENDENTE)
+
+  decididoEm    DateTime?
+  decididoPorId Int?
+  decididoPor   AdminUser? @relation("correcaoDecididaPor", fields: [decididoPorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Uma correção por item por rodada: mandar de novo corrige a anterior em
+  /// vez de empilhar três versões da mesma reclamação na sua tela.
+  @@unique([contagemId, produtoId])
+  @@index([status])
+  @@map("contagem_produto_correcoes")
+}
+
+/// Um produto nessa rodada de cotação — vai ficar aqui enquanto a gente compara
+/// quem deu o melhor preço e aprova.
+model CotacaoItem {
+  id Int @id @default(autoincrement())
+
+  cotacaoId Int
+  cotacao   Cotacao @relation(fields: [cotacaoId], references: [id], onDelete: Cascade)
+
+  produtoId Int
+  produto   Product @relation(fields: [produtoId], references: [id], onDelete: Cascade)
+
+  /// A categoria em que o produto está agora (denormalizado pra agrupar
+  /// facilmente na tela, sem precisar de JOIN em cada linha).
+  categoryId Int?
+
+  /// Quanto você contou na prateleira — puxado do ContagemItem automaticamente.
+  quantidadeContada Decimal @db.Decimal(10, 3)
+
+  /// Quantidade que o sistema sugere comprar (idealStock - quantidadeContada).
+  /// Calculado, não armazenado — aqui por referência.
+  /// quantidadeSugerida = produto.idealStock - quantidadeContada
+
+  /// A quantidade que você vai cotar de verdade. Pode ser menor que a sugestão.
+  quantidadeSolicitada Decimal @db.Decimal(10, 3)
+
+  /// Os preços que cada fornecedor deu para este item.
+  precos Preco[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([cotacaoId, produtoId])
+  @@index([produtoId])
+  @@index([categoryId])
+  @@map("cotacao_itens")
+}
+
+/// A resposta de um fornecedor nesta cotação — ele recebeu o link, entrou,
+/// e respondeu com preços.
+model CotacaoFornecedor {
+  id Int @id @default(autoincrement())
+
+  cotacaoId Int
+  cotacao   Cotacao @relation(fields: [cotacaoId], references: [id], onDelete: Cascade)
+
+  fornecedorId Int
+  fornecedor   Supplier @relation("cotacaoFornecedores", fields: [fornecedorId], references: [id], onDelete: Cascade)
+
+  /// Link único que só este fornecedor pode usar. Token sem senha —
+  /// a URL é a credencial.
+  token String @unique @db.VarChar(64)
+
+  estatus CotacaoFornecedorStatus @default(ENVIADA)
+
+  /// Os preços que ele deu — um por produto cotado.
+  precos Preco[]
+
+  /// O que ele quis oferecer e a casa nem pediu.
+  produtosNovos CotacaoProdutoNovo[]
+
+  /// O que ele respondeu sobre o que a casa perguntou por curiosidade.
+  pesquisaRespostas PesquisaResposta[]
+
+  dataEnvio DateTime @default(now())
+
+  /// Quando ele preencheu o formulário e respondeu.
+  dataRespostaRecebida DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([cotacaoId, fornecedorId])
+  @@index([fornecedorId])
+  @@map("cotacao_fornecedores")
+}
+
+/// Um item cotado — o preço que um fornecedor deu para um produto nesta cotação.
+model Preco {
+  id Int @id @default(autoincrement())
+
+  cotacaoItemId Int
+  cotacaoItem   CotacaoItem @relation(fields: [cotacaoItemId], references: [id], onDelete: Cascade)
+
+  cotacaoFornecedorId Int
+  cotacaoFornecedor   CotacaoFornecedor @relation(fields: [cotacaoFornecedorId], references: [id], onDelete: Cascade)
+
+  /// Preço por unidade DA CASA — kg, un, o que o produto usa.
+  ///
+  /// Deixou de ser digitado e passou a ser calculado: `precoEmbalagem` sobre
+  /// `conteudo`. O significado é o mesmo de sempre, e é de propósito — ele
+  /// aparece em cinquenta lugares, do comparativo ao histórico de preço, e é
+  /// o número que torna dois fornecedores comparáveis. Mudar o que ele quer
+  /// dizer seria mexer nos cinquenta; mudar quem o preenche não mexe em
+  /// nenhum.
+  precoUnitario Decimal @db.Decimal(12, 4)
+
+  /// Como ELE vende: "fardo", "bombona 5L", "caixa", "peça".
+  ///
+  /// A casa conta em un e kg; o fornecedor vende em embalagem, e cada um na
+  /// sua. Antes disto o link pedia o preço unitário e empurrava a divisão
+  /// para a cabeça dele, sem guardar quanto tinha dentro — três fornecedores
+  /// respondiam três coisas que não se comparavam, e era isso que estragava
+  /// a cotação.
+  ///
+  /// Nulo nas respostas antigas e no pedido direto, que grava o preço
+  /// unitário sem passar por aqui. Nulo é "não perguntamos", não "vende
+  /// avulso".
+  embalagem String?
+
+  /// Quantas unidades da casa cabem numa embalagem dele. Fardo com 12 un = 12.
+  conteudo Decimal? @db.Decimal(10, 3)
+
+  /// O que ele cobra pela embalagem inteira. É o número que ele sabe de cor.
+  precoEmbalagem Decimal? @db.Decimal(10, 2)
+
+  /// Preço por volume: "acima de 10 caixas, a caixa fica R$ 115".
+  ///
+  /// Os dois na MESMA medida de `precoEmbalagem` — quantas embalagens dele,
+  /// e quanto cada uma passa a custar —, porque é assim que ele fala. A
+  /// conversão para a unidade da casa é a mesma de sempre: dividir por
+  /// `conteudo`.
+  ///
+  /// Nulos juntos é o normal: não ofereceu desconto. Só informa — nenhuma
+  /// conta de total usa isto. `precoUnitario` continua sendo o preço da
+  /// linha, e é a casa quem decide se compra a quantidade que dá o desconto.
+  descontoAcimaDe        Decimal? @db.Decimal(10, 3)
+  descontoPrecoEmbalagem Decimal? @db.Decimal(10, 2)
+
+  /// O que ele respondeu sobre cada especificação do produto, com o texto
+  /// copiado no dia: `[{ texto, obrigatoria, atende }]`. Copiado porque o
+  /// cadastro pode mudar e o que ele confirmou não muda junto — a mesma
+  /// regra de `marca`. Nulo antes disto e em produto sem especificação.
+  especificacoes Json?
+
+  /// O preço que ele deu ANTES de a casa negociar, quando houve negociação.
+  ///
+  /// Nulo é o normal: ninguém negociou esta linha, e `precoUnitario` é o que
+  /// ele cotou. Preenchido, `precoUnitario` passou a ser o preço acertado por
+  /// mensagem, e este guarda de onde ele veio.
+  ///
+  /// Existe porque sobrescrever calado apagaria a única prova de que a
+  /// conversa valeu a pena. "R$ 1,09 → R$ 0,95" é o que diz se negociar com
+  /// este fornecedor rende, e é o que se leva para a negociação seguinte.
+  ///
+  /// Guarda o PRIMEIRO preço, não o anterior: negociar duas vezes na mesma
+  /// linha continua mostrando o que ele pediu no começo, que é a âncora real.
+  precoNegociadoDe Decimal? @db.Decimal(12, 4)
+
+  /// Se ele tem, se está sem, ou se nem trabalha com isso.
+  ///
+  /// Antes, "não tenho" era campo em branco — indistinguível de "esqueci de
+  /// responder", e o dono lia célula vazia como silêncio.
+  ///
+  /// ATENÇÃO: numa linha de recusa, `precoUnitario` e `subtotal` são zero, e
+  /// zero aqui NÃO é preço — é o lugar vazio de um campo que a coluna exige.
+  /// Quem decide se a linha é uma oferta é este campo, e por isso toda
+  /// comparação de preço filtra por `OFERTADO` antes de procurar o menor. Sem
+  /// esse filtro, quem não tem o produto ganharia todas as disputas com zero.
+  estatus PrecoStatus @default(OFERTADO)
+
+  /// A quantidade que ele respondeu (pode ser diferente da solicitada).
+  quantidadeSolicitada Decimal @db.Decimal(10, 3)
+
+  /// Subtotal = preço × quantidade. Calculado, armazenado pra agilizar a tela.
+  subtotal Decimal @db.Decimal(10, 2)
+
+  /// Prazo de entrega em dias, do maior valor citado por ele.
+  prazoEntregaDias Int?
+
+  /// Qual das marcas pedidas ele está oferecendo.
+  ///
+  /// Nulo quando o produto não pede marca nenhuma, ou quando ele não disse.
+  /// Texto livre e não referência: a lista do produto pode mudar depois, e
+  /// o que ele ofereceu naquele dia não muda junto.
+  marca String?
+
+  /// Observação que ele deixou (ex.: "fora de estoque", "frete à combinar").
+  observacoes String?
+
+  /// Você aprovó este fornecedor pra este item?
+  ///
+  /// Era "só um por item fica true", e deixou de ser: `dividirCompra` marca
+  /// dois ou mais quando a compra é repartida. O que continua valendo é que
+  /// clicar numa célula é escolher UM — trocar de fornecedor desfaz a divisão
+  /// inteira, e não acrescenta um segundo sim por acidente.
+  aprovado Boolean @default(false)
+
+  /// Quanto DESTE item sai deste fornecedor, quando a compra foi dividida.
+  ///
+  /// Nulo é o normal e quer dizer "leva o item inteiro": quem responde é
+  /// `CotacaoItem.quantidadeSolicitada`, como sempre foi. Preenchido, vale
+  /// isto — e a soma das partes fecha a quantidade do item, que é o que a
+  /// ação de dividir exige antes de gravar.
+  ///
+  /// Existe porque o melhor preço nem sempre tem a quantidade toda. Sem ela
+  /// a saída era pedir tudo a quem não pode entregar tudo, ou completar por
+  /// fora sem registro nenhum.
+  ///
+  /// NÃO mexe em `subtotal`: aquele é "quanto custaria tudo deste", que é o
+  /// que torna as colunas comparáveis. Encolhê-lo faria a coroa do mais
+  /// barato ir para quem levou a menor fatia.
+  quantidadeAprovada Decimal? @db.Decimal(10, 3)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([cotacaoItemId, cotacaoFornecedorId])
+  @@index([cotacaoFornecedorId])
+  @@index([aprovado])
+  @@map("precos")
+}
+
+/// Um produto que o fornecedor tem e a casa nunca pediu.
+///
+/// Tabela de espera pela mesma razão de `ContagemProdutoNovo`: produto meio
+/// aprovado vazaria para a cotação, o pedido, a exportação e a contagem
+/// seguinte, e `Product.name` não tem índice único — o lixo se acumularia na
+/// tabela de verdade.
+///
+/// A diferença é quem escreve. Ali é o estoquista da casa; aqui é gente de
+/// fora, com um link e nenhuma senha, que tem interesse comercial no que
+/// escreve. Motivo de sobra para o texto dele nunca virar cadastro sem
+/// alguém daqui dizer que sim.
+///
+/// O preço viaja junto e NÃO vira `Preco`: preço mora colado num
+/// `CotacaoItem`, e este produto não é item de nenhuma cotação. Aqui ele é o
+/// que faz a oferta valer a pena olhar — sem número, "tenho azeite" não é
+/// oferta, é conversa.
+model CotacaoProdutoNovo {
+  id Int @id @default(autoincrement())
+
+  cotacaoFornecedorId Int
+  cotacaoFornecedor   CotacaoFornecedor @relation(fields: [cotacaoFornecedorId], references: [id], onDelete: Cascade)
+
+  /// O que ele escreveu. Vira `Product.name` na autorização, depois de o dono
+  /// poder corrigir — o nome que o fornecedor usa é o do catálogo dele.
+  nome String
+
+  /// A unidade em que a CASA contaria isto, escolhida entre as nossas. É ela
+  /// que dá sentido ao conteúdo da embalagem: "fardo com 12" só quer dizer
+  /// alguma coisa depois de saber 12 do quê.
+  unit ProductUnit
+
+  /// Como ele vende, na mesma gramática da resposta de preço.
+  embalagem      String
+  conteudo       Decimal @db.Decimal(10, 3)
+  precoEmbalagem Decimal @db.Decimal(10, 2)
+
+  marca       String
+  observacoes String?
+
+  status ProdutoNovoStatus @default(PENDENTE)
+
+  /// O cadastro que nasceu daqui. Nulo enquanto ninguém autorizou — e volta a
+  /// ser nulo se o produto for apagado, porque a oferta continua sendo
+  /// história de que alguém se ofereceu para vender aquilo.
+  produtoId Int?
+  produto   Product? @relation(fields: [produtoId], references: [id], onDelete: SetNull)
+
+  /// Quem decidiu e quando. Recusada não é apagada: saber que este fornecedor
+  /// já ofereceu isto é o que evita responder duas vezes a mesma oferta.
+  decididoEm    DateTime?
+  decididoPorId Int?
+  decididoPor   AdminUser? @relation(fields: [decididoPorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cotacaoFornecedorId])
+  @@index([status])
+  @@map("cotacao_produtos_novos")
+}
+
+/// Uma pergunta solta que pega carona na cotação: "você tem isto, e por
+/// quanto?".
+///
+/// É o espelho de `CotacaoProdutoNovo`. Lá o FORNECEDOR oferece o que a casa
+/// não compra; aqui a CASA pergunta sobre o que não compra. Os dois existem
+/// porque a rodada de cotação é a única hora da semana em que sete
+/// fornecedores estão olhando para a mesma tela — e a pergunta que ficaria
+/// para um WhatsApp que nunca sai custa, aqui, uma linha de texto.
+///
+/// Texto livre, e não `produtoId`: o ponto é justamente não ter cadastro. Ter
+/// que cadastrar "azeite trufado" antes de perguntar se alguém vende azeite
+/// trufado inverteria a ordem das coisas, e encheria o catálogo de produtos
+/// que a casa nunca comprou.
+///
+/// Não entra na comparação nem vira pedido. Se a resposta agradar, o caminho
+/// é cadastrar o produto e comprá-lo na rodada seguinte, como qualquer outro.
+model PesquisaPreco {
+  id Int @id @default(autoincrement())
+
+  cotacaoId Int
+  cotacao   Cotacao @relation(fields: [cotacaoId], references: [id], onDelete: Cascade)
+
+  /// O que ele quer saber, escrito por ele: "azeite trufado 500ml".
+  descricao String
+
+  /// O detalhe que a descrição não cabe: marca preferida, para que serve, até
+  /// quanto ele pagaria.
+  observacoes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  respostas PesquisaResposta[]
+
+  @@index([cotacaoId])
+  @@map("pesquisa_precos")
+}
+
+/// O que um fornecedor respondeu sobre um item da pesquisa.
+///
+/// `temProduto` é o campo que faz a pesquisa valer: sem ele, "não tenho" e
+/// "não respondi" seriam a mesma linha vazia, e a casa ficaria esperando por
+/// uma resposta que já veio. Um `false` aqui é informação — quem não tem hoje
+/// é quem não adianta perguntar de novo no mês que vem.
+///
+/// Preço nulo com `temProduto` verdadeiro é o caso real de quem tem mas
+/// precisa consultar: melhor guardar "tem, preço a ver" do que obrigá-lo a
+/// inventar um número para conseguir mandar a resposta.
+model PesquisaResposta {
+  id Int @id @default(autoincrement())
+
+  pesquisaId Int
+  pesquisa   PesquisaPreco @relation(fields: [pesquisaId], references: [id], onDelete: Cascade)
+
+  cotacaoFornecedorId Int
+  cotacaoFornecedor   CotacaoFornecedor @relation(fields: [cotacaoFornecedorId], references: [id], onDelete: Cascade)
+
+  /// Ele vende isto?
+  temProduto Boolean
+
+  /// Por quanto, e de que jeito ele vende. Tudo opcional: quem não tem não
+  /// preenche nada, e quem tem pode não saber o preço na hora.
+  precoUnitario Decimal? @db.Decimal(12, 4)
+  embalagem     String?
+  marca         String?
+  observacoes   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Uma resposta por fornecedor por pergunta. Ele volta ao link e corrige a
+  /// mesma linha, em vez de deixar duas versões e a dúvida de qual vale.
+  @@unique([pesquisaId, cotacaoFornecedorId])
+  @@index([cotacaoFornecedorId])
+  @@map("pesquisa_respostas")
+}
+
+/// Um pedido de compra gerado após você aprovar quem vence cada item.
+model PedidoCompra {
+  id Int @id @default(autoincrement())
+
+  /// Nulo no pedido direto: ele não nasce de comparação nenhuma, nasce do
+  /// produto ser exclusivo de um fornecedor. `@@unique` abaixo continua
+  /// funcionando com isto nulo — o Postgres trata cada NULL como distinto
+  /// num índice composto, então vários pedidos diretos para o mesmo
+  /// fornecedor não colidem entre si.
+  cotacaoId Int?
+  cotacao   Cotacao? @relation(fields: [cotacaoId], references: [id], onDelete: Cascade)
+
+  /// A contagem que gerou este pedido, quando foi assim que ele nasceu —
+  /// direto, sem passar por cotação. Nulo no pedido que veio de cotação.
+  contagemId Int?
+  contagem   Contagem? @relation(fields: [contagemId], references: [id], onDelete: SetNull)
+
+  /// O fornecedor não entregou e não vai entregar: o pedido foi encerrado
+  /// (cancelado) em Recebimentos com "Não foi entregue". Conta como falha
+  /// dele no relatório de fornecedores, nesta data.
+  naoEntregueEm DateTime?
+
+  /// A Requisição de onde o pedido nasceu (pela contagem dela ou pela
+  /// contagem geral do dia). É o que diz "a Requisição de hoje já tem pedido".
+  listaCompraId Int?
+  listaCompra   ListaCompra? @relation(fields: [listaCompraId], references: [id], onDelete: SetNull)
+
+  fornecedorId Int
+  fornecedor   Supplier @relation("pedidosCompra", fields: [fornecedorId], references: [id], onDelete: Cascade)
+
+  /// O link que o fornecedor exclusivo usa pra confirmar o preço deste
+  /// pedido, sem login. Nulo no pedido de cotação — ali quem confirmou o
+  /// preço foi o link da cotação, não este.
+  token String? @unique @db.VarChar(64)
+
+  /// Em que estágio o pedido está (aguardando o fornecedor, criado,
+  /// enviado, entregue, etc.).
+  estatus PedidoCompraStatus @default(CRIADO)
+
+  /// Os itens que este fornecedor vence.
+  itens PedidoCompraItem[]
+
+  /// Soma de todos os subtotais deste pedido.
+  precoTotal Decimal @db.Decimal(10, 2)
+
+  dataPronta DateTime @default(now())
+
+  /// Quando você enviou pro fornecedor (WhatsApp, e-mail, etc.).
+  dataEnvio DateTime?
+
+  /// O prazo que o fornecedor prometeu (data mais tardía entre todos os itens).
+  dataEntregaPrevista DateTime?
+
+  /// Quando chegou de fato.
+  dataEntregaReal DateTime?
+
+  /// Você já conferiu e marcou como entregue (mesmo que parcial).
+  entregaConfirmada Boolean @default(false)
+
+  /// Observações sobre o pedido (itens trocados, etc.).
+  observacoes String?
+
+  /// Preenchido, a mercadoria chegou sem pedido e este registro nasceu na
+  /// porta, já recebido. Nulo em todo pedido de verdade.
+  motivoSemPedido MotivoSemPedido?
+
+  /// A chave de acesso (44 dígitos) da nota do mercado que virou esta
+  /// entrada, lida pelo QR Code. Única: a mesma nota não entra duas vezes no
+  /// estoque. Nula em toda entrada que não veio de nota lida.
+  notaChave String? @unique @db.VarChar(44)
+
+  /// Chegou diferente do combinado (quantidade, preço ou problema) e alguém
+  /// decidiu o que fazer: quando, o quê, quem e uma nota. Nulo enquanto a
+  /// diferença espera em Pendências — ou quando não houve diferença.
+  divergenciaResolvidaEm    DateTime?
+  divergenciaDesfecho       DesfechoDivergencia?
+  divergenciaNota           String?
+  divergenciaResolvidaPorId Int?
+  divergenciaResolvidaPor   AdminUser?           @relation("divergenciaResolvidaPor", fields: [divergenciaResolvidaPorId], references: [id], onDelete: SetNull)
+
+  /// Quando o desfecho foi "crédito": o dia em que ele foi abatido num pedido
+  /// seguinte, e quem marcou. Nulo, o crédito continua em Pendências — antes
+  /// ele sumia no clique de "crédito" e ninguém cobrava.
+  creditoAbatidoEm    DateTime?
+  creditoAbatidoPorId Int?
+  creditoAbatidoPor   AdminUser? @relation("creditoAbatidoPor", fields: [creditoAbatidoPorId], references: [id], onDelete: SetNull)
+
+  avisos                AvisoCompra[]
+  bonificacoes          Bonificacao[] @relation("BonificacoesDoPedido")
+  /// Chegou sem pedido: as bonificações que esta entrada trouxe.
+  bonificacoesEntregues Bonificacao[] @relation("BonificacoesEntregues")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([cotacaoId, fornecedorId])
+  @@index([fornecedorId])
+  @@index([estatus])
+  @@index([contagemId])
+  @@index([listaCompraId])
+  /// Relatórios, balanço e desempenho filtram o recebido por data de entrega;
+  /// o orçamento da semana filtra o pedido por data de criação.
+  @@index([entregaConfirmada, dataEntregaReal])
+  /// Atrasados e a agenda de entregas: os que ainda não chegaram, pela previsão.
+  @@index([entregaConfirmada, dataEntregaPrevista])
+  @@index([createdAt])
+  @@map("pedidos_compra")
+}
+
+/// Um item num pedido de compra — o que chegou e o que você recebeu.
+model PedidoCompraItem {
+  id Int @id @default(autoincrement())
+
+  pedidoCompraId Int
+  pedidoCompra   PedidoCompra @relation(fields: [pedidoCompraId], references: [id], onDelete: Cascade)
+
+  produtoId Int
+  produto   Product @relation(fields: [produtoId], references: [id], onDelete: Cascade)
+
+  /// O que você pediu.
+  quantidadeSolicitada Decimal @db.Decimal(10, 3)
+
+  /// O que realmente chegou (você entra quando recebe).
+  quantidadeRecebida Decimal? @db.Decimal(10, 3)
+
+  /// O preço unitário aprovado (fixo, pra rastreabilidade).
+  ///
+  /// Nulo só existe no pedido direto, entre o link ser gerado e o
+  /// fornecedor confirmar — e nulo não é zero: zero seria "de graça", nulo
+  /// é "ainda não sei". Se a mercadoria chegar antes de ele responder, quem
+  /// confere digita o preço na hora; nada trava a entrada por causa disto.
+  precoUnitario Decimal? @db.Decimal(12, 4)
+
+  /// Qual das marcas pedidas ele está mandando. Mesma razão do campo em
+  /// `Preco`: texto livre, congelado no que foi combinado naquele pedido.
+  marca String?
+
+  /// Se veio errado, anota aqui.
+  observacoes String?
+
+  /// O ✕ da conferência: por que veio menos (ou nada). Nulo quando veio certo
+  /// ou ainda não foi recebido. Campo próprio para não apagar a observação
+  /// que o fornecedor escreveu.
+  problemaRecebimento ProblemaRecebimento?
+
+  /// O que a casa pagou de fato, pela nota. `precoUnitario` é o combinado;
+  /// os dois juntos mostram a diferença. Nulo antes de receber.
+  precoPago Decimal? @db.Decimal(12, 4)
+
+  /// Compra no atacado: o último custo do produto, congelado quando o pedido
+  /// nasceu. É só referência — fica fora de `precoUnitario` de propósito,
+  /// senão toda compra a outro preço viraria "diferença" em Pendências.
+  precoEstimado Decimal? @db.Decimal(12, 4)
+
+  /// O fornecedor avisou, pelo link do pedido, que não tem este item. Não é o
+  /// `problemaRecebimento` FALTA (esse é quem confere, na porta): é o aviso
+  /// antes, para a casa poder buscar em outro lugar a tempo.
+  emFalta Boolean @default(false)
+
+  /// As estrelas desta entrega: a de quem recebeu e a do dono.
+  avaliacoes AvaliacaoQualidade[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([pedidoCompraId, produtoId])
+  @@index([produtoId])
+  @@map("pedido_compra_itens")
+}
+
+/// Histórico de compras — que preço o fornecedor cobrou antes, quando,
+/// pra você decidir se vale mudar ou não.
+model HistoricoPrecosCompra {
+  id Int @id @default(autoincrement())
+
+  produtoId Int
+  produto   Product @relation("historico", fields: [produtoId], references: [id], onDelete: Cascade)
+
+  /// Nulo é "compra que o sistema não viu acontecer".
+  ///
+  /// O catálogo entrou por um relatório de compra do ERP anterior, que traz o
+  /// custo de cada item mas não de quem foi comprado. Inventar um fornecedor
+  /// para segurar esses preços poria uma empresa que não existe na lista de
+  /// quem a casa chama para cotar — e é dessa lista que sai o convite da
+  /// cotação. Preferimos admitir que não sabemos.
+  ///
+  /// SetNull, e não Cascade, pelo mesmo motivo: apagar um fornecedor não pode
+  /// levar junto a memória do que a casa pagou.
+  fornecedorId Int?
+  fornecedor   Supplier? @relation("historico", fields: [fornecedorId], references: [id], onDelete: SetNull)
+
+  /// Preço que ele cobrou naquela vez.
+  precoUnitario Decimal @db.Decimal(12, 4)
+
+  prazoEntregaDias Int?
+
+  dataCompra DateTime
+
+  /// O item de pedido cuja entrada criou esta linha — para desfazer quando o
+  /// pedido recebido é cancelado. Nulo nas linhas de antes.
+  pedidoCompraItemId Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([fornecedorId])
+  @@index([dataCompra])
+  @@index([pedidoCompraItemId])
+  /// O último custo de cada produto (`DISTINCT ON` por produto, o mais novo primeiro).
+  @@index([produtoId, dataCompra(sort: Desc)])
+  @@map("historico_precos_compra")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Compras — configuração
+// ---------------------------------------------------------------------------
+
+/// Linha única (id = 1). O que a casa configura na cotação.
+///
+/// Nasce com um campo só de propósito: prazo, critério de aprovação e mínimo
+/// de fornecedores são decisões que ainda não existem. A tabela cresce quando
+/// elas existirem.
+model CotacaoSettings {
+  id Int @id @default(1)
+
+  /// O texto que o fornecedor lê acima da lista de itens. Livre, com quebras
+  /// de linha; nulo = usa o padrão escrito no código.
+  ///
+  /// Ao contrário do aviso da reserva, nulo aqui não significa "não mostra
+  /// nada": a página do fornecedor é pública e sem login, e não pode ficar
+  /// muda porque ninguém preencheu um campo.
+  mensagemFornecedor String?
+
+  /// O link de atalhos para o estoquista e o recebedor: sem login, a porta é
+  /// este código. Nulo = link desligado. Trocar gera outro e o antigo para de
+  /// valer no próximo clique.
+  atalhoToken       String?   @unique @db.VarChar(64)
+  /// Quem gerou o link: o que for feito por ele fica em nome desta pessoa.
+  atalhoCriadoPorId Int?
+  atalhoCriadoEm    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("cotacao_settings")
+}
+
+/// O relatório de compras que sai sozinho, por e-mail (com PDF) e no celular,
+/// num dia da semana. Linha única (id = 1), como as outras configurações.
+///
+/// `periodo` é o que o relatório cobre, contado a partir do dia do envio:
+/// "semana-passada" (segunda a domingo), "7", "14", "mes-passado" ou "mes"
+/// (do dia 1 até ontem). `ultimoEnvioDia` é a data da casa em que saiu: o
+/// cron roda todo dia e não manda duas vezes no mesmo dia.
+model RelatorioAgendado {
+  id             Int       @id @default(1)
+  ativo          Boolean   @default(false)
+  /// 0 = domingo ... 6 = sábado, no calendário da casa.
+  diaSemana      Int       @default(2)
+  periodo        String    @default("semana-passada") @db.VarChar(20)
+  /// Um e-mail por linha.
+  emails         String    @default("")
+  celular        Boolean   @default(true)
+  ultimoEnvioEm  DateTime?
+  ultimoEnvioDia String?   @db.VarChar(10)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@map("relatorio_agendado")
+}
+
+/// Uma lista de compra fixa: os produtos que se pedem a um fornecedor num dia
+/// da semana — "Hortifruti Ivoti — segunda".
+///
+/// O rascunho da conferência de uma rodada: as quantidades digitadas e os
+/// itens tirados, salvos sem criar pedido — para sair da tela e voltar sem
+/// perder o que foi conferido. Um por rodada (as contagens juntas); some
+/// quando a rodada vira compra.
+/// Quem deu a nota: quem recebeu a mercadoria, ou o dono depois.
+enum OrigemAvaliacao {
+  RECEBIMENTO
+  DONO
+}
+
+/// A nota de qualidade de UMA entrega de um produto escolhido para avaliação.
+///
+/// É da entrega, e não do produto: a mesma tilápia vem boa numa semana e mole
+/// na outra, de marcas e fornecedores diferentes. A marca e o fornecedor ficam
+/// congelados aqui, do jeito que eram naquela entrega — é por eles que a
+/// média responde "qual marca entrega melhor".
+///
+/// Uma de quem recebeu e uma do dono por entrega (`@@unique`); o dono pode
+/// refazer a dele.
+model AvaliacaoQualidade {
+  id Int @id @default(autoincrement())
+
+  produtoId          Int
+  produto            Product          @relation(fields: [produtoId], references: [id], onDelete: Cascade)
+  pedidoCompraItemId Int
+  pedidoCompraItem   PedidoCompraItem @relation(fields: [pedidoCompraItemId], references: [id], onDelete: Cascade)
+  fornecedorId       Int?
+  fornecedor         Supplier?        @relation(fields: [fornecedorId], references: [id], onDelete: SetNull)
+  marca              String?
+
+  origem     OrigemAvaliacao
+  /// De 1 a 5.
+  nota       Int
+  /// Obrigatório com 1 ou 2 estrelas: nota baixa sem motivo não ensina nada.
+  comentario String?
+  autorId    Int?
+  autor      AdminUser?      @relation(fields: [autorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([pedidoCompraItemId, origem])
+  @@index([produtoId])
+  @@index([fornecedorId])
+  @@map("avaliacoes_qualidade")
+}
+
+/// O que o aviso conta.
+enum TipoAviso {
+  /// O exclusivo mandou preço pelo link do pedido direto.
+  PEDIDO_RESPONDIDO
+  /// O exclusivo avisou pelo link que não tem um ou mais itens.
+  ITEM_EM_FALTA
+  COTACAO_RESPONDIDA
+  COTACAO_RECUSADA
+  /// Recebido e conferido, tudo como combinado.
+  RECEBIDO_OK
+  /// Recebido com quantidade, preço ou problema diferente do combinado.
+  RECEBIDO_COM_DIFERENCA
+}
+
+/// Um ato de fornecedor que a casa precisa saber, gravado no instante em
+/// que acontece.
+///
+/// Existe porque o resto do banco guarda só o estado de agora: o fornecedor
+/// que reenvia o preço, muda o dia ou marca e desmarca "em falta" apaga o
+/// que era antes. O aviso é o registro — o texto sai pronto, congelado
+/// naquele momento, e não recalculado depois.
+///
+/// "Lido" é da casa, não de cada usuário: quem cuida das compras é uma
+/// pessoa, e um aviso visto por ela está visto.
+model AvisoCompra {
+  id   Int       @id @default(autoincrement())
+  tipo TipoAviso
+
+  fornecedorId Int?
+  fornecedor   Supplier?     @relation(fields: [fornecedorId], references: [id], onDelete: SetNull)
+  pedidoId     Int?
+  pedido       PedidoCompra? @relation(fields: [pedidoId], references: [id], onDelete: SetNull)
+  cotacaoId    Int?
+  cotacao      Cotacao?      @relation(fields: [cotacaoId], references: [id], onDelete: SetNull)
+
+  titulo  String
+  detalhe String?
+  /// Em falta: `[{ produtoId, nome, quantidade }]` — é o que monta o
+  /// "Comprar de outro".
+  itens   Json?
+
+  /// Pede algo da casa (hoje, só o item em falta). É o que conta no menu
+  /// enquanto `resolvidoEm` for nulo.
+  pedeAcao    Boolean   @default(false)
+  resolvidoEm DateTime?
+  lidoEm      DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([pedeAcao, resolvidoEm])
+  @@index([pedidoId])
+  /// O número de avisos não lidos, em toda visita a Pendências.
+  @@index([lidoEm])
+  @@map("avisos_compra")
+}
+
+model RascunhoConferencia {
+  /// Os ids das contagens da rodada, em ordem: "27,29".
+  chave       String   @id @db.VarChar(200)
+  /// { "<produtoId>": "12,5" } — texto, como está no campo.
+  quantidades Json
+  /// Os produtos tirados da compra (o ✕).
+  fora        Int[]
+  updatedAt   DateTime @updatedAt
+
+  @@map("rascunhos_conferencia")
+}
+
+/// O orçamento de compra de uma semana: o faturamento da semana anterior,
+/// digitado uma vez, na primeira compra, e a meta de CMV teórico em % dele.
+/// Orçamento = faturamento × meta; o gasto é tudo o que foi pedido na semana.
+model OrcamentoSemana {
+  id Int @id @default(autoincrement())
+
+  /// A segunda-feira da semana, no calendário da casa.
+  semana DateTime @unique @db.Date
+
+  faturamentoAnterior Decimal @db.Decimal(12, 2)
+  metaCmv             Decimal @db.Decimal(5, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("orcamentos_semana")
+}
+
+/// Uma por dia, e não uma com dias por produto: o dono pensa no pedido de
+/// segunda e no de quinta como coisas separadas. Contada no dia, só com estes
+/// produtos, e ao finalizar vira pedido para o fornecedor sem passar por
+/// cotação.
+model ListaCompra {
+  id Int @id @default(autoincrement())
+
+  nome String @db.VarChar(120)
+
+  fornecedorId Int
+  fornecedor   Supplier @relation(fields: [fornecedorId], references: [id], onDelete: Cascade)
+
+  /// 0 = domingo … 6 = sábado, no fuso da casa.
+  diaSemana Int
+
+  /// Quem costuma contar: recebe o link. Nulo = quem abrir a contagem.
+  responsavelId Int?
+  responsavel   AdminUser? @relation(fields: [responsavelId], references: [id], onDelete: SetNull)
+
+  /// Quanto tempo o link da contagem fica aberto.
+  prazoHoras Int @default(12)
+
+  /// Desligada não aparece em "Listas de hoje", mas continua cadastrada.
+  ativa Boolean @default(true)
+
+  itens     ListaCompraItem[]
+  contagens Contagem[]
+  pedidos   PedidoCompra[]
+
+  idealSugerido SugestaoIdealRequisicao[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([diaSemana])
+  @@map("listas_compra")
+}
+
+model ListaCompraItem {
+  listaId Int
+  lista   ListaCompra @relation(fields: [listaId], references: [id], onDelete: Cascade)
+
+  produtoId Int
+  produto   Product @relation(fields: [produtoId], references: [id], onDelete: Cascade)
+
+  /// O ideal deste produto NESTE dia: o abacaxi da segunda cobre até quinta,
+  /// o da quinta cobre o fim de semana. Obrigatório e só da compra de rotina:
+  /// o ideal do cadastro do produto não entra na conta dela.
+  idealStock Decimal @db.Decimal(10, 3)
+
+  createdAt DateTime @default(now())
+
+  @@id([listaId, produtoId])
+  /// "Fora das Requisições" (cotação e conferir) pergunta pelo produto.
+  @@index([produtoId])
+  @@map("lista_compra_itens")
+}
+
+/// O estoquista achou que o ideal de um produto numa Requisição está errado.
+/// Só vale depois que o dono aceita em Pendências.
+model SugestaoIdealRequisicao {
+  id Int @id @default(autoincrement())
+
+  listaId Int
+  lista   ListaCompra @relation(fields: [listaId], references: [id], onDelete: Cascade)
+
+  produtoId Int
+  produto   Product @relation(fields: [produtoId], references: [id], onDelete: Cascade)
+
+  /// A contagem em que ele sugeriu.
+  contagemId Int?
+  contagem   Contagem? @relation(fields: [contagemId], references: [id], onDelete: SetNull)
+
+  /// O ideal que valia quando ele sugeriu (o da Requisição ou o do cadastro).
+  idealAntes    Decimal? @db.Decimal(10, 3)
+  idealSugerido Decimal  @db.Decimal(10, 3)
+  motivo        String?
+
+  status ProdutoNovoStatus @default(PENDENTE)
+
+  decididoEm    DateTime?
+  decididoPorId Int?
+  decididoPor   AdminUser? @relation("idealSugeridoDecididoPor", fields: [decididoPorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([status])
+  @@index([listaId, produtoId])
+  @@map("sugestoes_ideal_requisicao")
+}
+
+/// O que a bonificação combinada traz.
+enum TipoBonificacao {
+  /// Mais unidades do mesmo produto do pedido ("a cada 10, vem 1").
+  UNIDADES
+  /// Outro produto, de brinde.
+  BRINDE
+  /// Um valor abatido na própria nota.
+  DESCONTO_NA_NOTA
+  /// Um valor que fica de crédito para um próximo pedido.
+  CREDITO
+}
+
+enum EstadoBonificacao {
+  /// Combinada, ainda não conferida.
+  COMBINADA
+  /// Veio (unidades, brinde) ou veio abatido (desconto).
+  RECEBIDA
+  /// A entrega chegou sem ela: vira pendência.
+  NAO_VEIO
+  /// Crédito já usado num pedido.
+  ABATIDA
+  /// Desistiu-se dela.
+  CANCELADA
+}
+
+/// Uma bonificação negociada com o fornecedor.
+///
+/// Fica fora dos itens do pedido de propósito: o pedido tem uma linha por
+/// produto, e a unidade bonificada somada ali faria o recebimento acusar
+/// "veio a mais". E o preço de tabela não muda — a bonificação é um ganho à
+/// parte, que os relatórios mostram separado. Nunca grava histórico de
+/// preço: um item de graça puxaria o último custo para zero.
+///
+/// Nasce na cotação (`cotacaoId`, antes de o pedido existir) e passa para o
+/// pedido quando a compra é confirmada; ou nasce direto no pedido.
+model Bonificacao {
+  id                 Int               @id @default(autoincrement())
+  fornecedorId       Int
+  fornecedor         Supplier          @relation(fields: [fornecedorId], references: [id], onDelete: Cascade)
+  cotacaoId          Int?
+  cotacao            Cotacao?          @relation(fields: [cotacaoId], references: [id], onDelete: SetNull)
+  pedidoCompraId     Int?
+  pedidoCompra       PedidoCompra?     @relation("BonificacoesDoPedido", fields: [pedidoCompraId], references: [id], onDelete: Cascade)
+  tipo               TipoBonificacao
+  /// Para UNIDADES e BRINDE.
+  produtoId          Int?
+  produto            Product?          @relation(fields: [produtoId], references: [id], onDelete: Restrict)
+  quantidade         Decimal?          @db.Decimal(10, 3)
+  /// Para DESCONTO_NA_NOTA e CREDITO.
+  valor              Decimal?          @db.Decimal(10, 2)
+  nota               String?
+  estado             EstadoBonificacao @default(COMBINADA)
+  quantidadeRecebida Decimal?          @db.Decimal(10, 3)
+  /// A própria bonificação somou `quantidadeRecebida` no estoque (no
+  /// recebimento ou em "chegou depois"). Falso quando ela veio numa entrada
+  /// "chegou sem pedido", que já somou por conta própria.
+  estoqueSomado      Boolean           @default(false)
+  /// A entrada "chegou sem pedido" que trouxe a bonificação.
+  entradaSemPedidoId Int?
+  entradaSemPedido   PedidoCompra?     @relation("BonificacoesEntregues", fields: [entradaSemPedidoId], references: [id], onDelete: SetNull)
+  recebidaEm         DateTime?
+  resolvidaEm        DateTime?
+  /// Conta que resolveu ou criou (sem relação: só para registro).
+  resolvidaPorId     Int?
+  criadoPorId        Int?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  @@index([fornecedorId])
+  @@index([pedidoCompraId])
+  @@index([cotacaoId, fornecedorId])
+  @@index([entradaSemPedidoId])
+  /// As que não vieram, no número do menu e em Pendências.
+  @@index([estado])
+  @@map("bonificacoes")
+}
+
+// ---------------------------------------------------------------------------
+// Departamento pessoal: quem trabalha na casa, a escala do almoço e as férias.
+// ---------------------------------------------------------------------------
+
+/// CLT tem admissão, salário e férias; free lancer tem diária e não tem férias.
+enum TipoContrato {
+  CLT
+  /// Fixo sem registro: salário por mês e férias como o CLT, sem carteira.
+  FIXO
+  FREELANCER
+}
+
+/// As duas equipes da escala, como na planilha: Cozinha e Salão.
+enum AreaDeTrabalho {
+  COZINHA
+  SALAO
+}
+
+model Colaborador {
+  id                 Int             @id @default(autoincrement())
+  nome               String          @db.VarChar(80)
+  /// Como a equipe chama: é o que aparece na escala. Nulo = o nome.
+  apelido            String?         @db.VarChar(40)
+  telefone           String?         @db.VarChar(20)
+  tipo               TipoContrato
+  /// A equipe de costume. Nulo = cobre as duas (folguista, free de fim de semana).
+  area               AreaDeTrabalho?
+  funcaoId           Int?
+  funcao             Funcao?         @relation(fields: [funcaoId], references: [id], onDelete: SetNull)
+  /// Desligado sai da escala e das listas de escolha; o histórico fica.
+  ativo              Boolean         @default(true)
+  /// O dia em que começou na casa, em qualquer tipo. No fixo (sem
+  /// registro), é dele que contam as férias.
+  comecouEm          DateTime?       @db.Date
+  /// CLT: o dia em que a carteira foi assinada. As férias contam daqui.
+  admissao           DateTime?       @db.Date
+  /// CLT, por mês. Só quem configura o módulo vê.
+  salario            Decimal?        @db.Decimal(10, 2)
+  /// Free lancer, por dia escalado.
+  diaria             Decimal?        @db.Decimal(10, 2)
+  observacoes        String?         @db.VarChar(500)
+  /// Só os 11 dígitos. Só quem configura o módulo vê.
+  cpf                String?         @db.VarChar(11)
+  nascimento         DateTime?       @db.Date
+  endereco           String?         @db.VarChar(200)
+  emergenciaNome     String?         @db.VarChar(80)
+  emergenciaTelefone String?         @db.VarChar(20)
+  /// Os dias da semana (0 = domingo) em que trabalha. Vazio = sem dia
+  /// marcado. A escala usa para separar folga de quem ficou sem posto.
+  diasDeTrabalho     Int[]           @default([])
+
+  /// CLT: o último dia do contrato de experiência (45 ou 90 dias, com a prorrogação).
+  experienciaAte    DateTime? @db.Date
+  /// O último ASO (atestado de saúde ocupacional) e até quando ele vale.
+  asoFeitoEm        DateTime? @db.Date
+  asoValidoAte      DateTime? @db.Date
+  /// Manipula alimentos: o ASO dele é cobrado mesmo sem data, pela vigilância sanitária.
+  manipulaAlimentos Boolean   @default(false)
+
+  /// CLT de jovem aprendiz: contrato com prazo (até 2 anos), que termina em `contratoAte`.
+  aprendiz    Boolean   @default(false)
+  contratoAte DateTime? @db.Date
+
+  /// Como saiu (pedido, dispensa, fim de contrato) e por quê (o motivo de verdade, para a retenção).
+  motivoDesligamento  MotivoDesligamento?
+  razaoDesligamento   String?             @db.VarChar(40)
+  detalheDesligamento String?             @db.VarChar(300)
+  /// O dia em que foi desligado. O salário conta no CMO até a véspera.
+  desligadoEm         DateTime?           @db.Date
+  /// Veio pelo link de cadastro e espera a aprovação. Enquanto isso fica
+  /// desligado (ativo = false): fora da escala e das listas.
+  pendente            Boolean             @default(false)
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  escalaFixa    EscalaFixa[]
+  escalaDoDia   EscalaDoDia[]
+  itensDeCusto  ItemDoColaborador[]
+  ferias        Ferias[]
+  diariasDoDia  DiariaDoDia[]
+  treinamentos  Treinamento[]
+  entregasDeEpi EntregaDeEpi[]
+  dependentes   Dependente[]
+  documentos    DocumentoDoColaborador[]
+
+  @@index([ativo])
+  @@index([pendente])
+  @@index([funcaoId])
+  @@map("colaboradores")
+}
+
+/// O cadastro das funções da casa (garçom, auxiliar de cozinha, financeiro).
+/// Desligada some das listas de escolha; quem já tinha continua com ela.
+model Funcao {
+  id        Int      @id @default(autoincrement())
+  nome      String   @unique @db.VarChar(60)
+  ativo     Boolean  @default(true)
+  createdAt DateTime @default(now())
+  /// As responsabilidades da função, em texto (módulo Operacional).
+  descricao String?
+
+  colaboradores         Colaborador[]
+  processosObrigatorios ProcessoDaFuncao[]
+
+  @@map("funcoes")
+}
+
+/// O link que a pessoa abre para preencher o próprio cadastro. Um por pessoa:
+/// serve uma vez e vence. O tipo (CLT ou free) quem escolhe é a casa.
+model ConviteColaborador {
+  id            Int          @id @default(autoincrement())
+  token         String       @unique @db.VarChar(64)
+  tipo          TipoContrato
+  /// Para a casa saber de quem é o link antes de ele virar cadastro.
+  paraQuem      String?      @db.VarChar(80)
+  expiraEm      DateTime
+  /// Preenchido, o link morre.
+  usadoEm       DateTime?
+  colaboradorId Int?
+  /// Link para quem já é da equipe atualizar o próprio cadastro: nasce com
+  /// `colaboradorId` e o envio espera a aprovação em Pendências.
+  paraAtualizar Boolean      @default(false)
+  /// O que a pessoa mandou na atualização, até a casa aprovar ou recusar.
+  dados         Json?
+  /// Aprovada ou recusada: sai de Pendências.
+  resolvidoEm   DateTime?
+  createdAt     DateTime     @default(now())
+
+  @@index([usadoEm])
+  @@map("convites_colaborador")
+}
+
+/// A diária do free num dia da semana, quando é diferente da de sempre
+/// (`Colaborador.diaria`). Sem linha no dia, vale a de sempre.
+model DiariaDoDia {
+  colaboradorId Int
+  colaborador   Colaborador @relation(fields: [colaboradorId], references: [id], onDelete: Cascade)
+  /// 0 = domingo, como `EscalaFixa.diaSemana`.
+  diaSemana     Int
+  valor         Decimal     @db.Decimal(10, 2)
+
+  @@id([colaboradorId, diaSemana])
+  @@map("diarias_do_dia")
+}
+
+/// Uma linha da escala: um posto, uma pessoa por dia. "Salão" com quatro
+/// pessoas são quatro postos (Salão 1 a 4), como as quatro linhas da planilha.
+model PostoDaEscala {
+  id           Int            @id @default(autoincrement())
+  area         AreaDeTrabalho
+  nome         String         @db.VarChar(40)
+  ordem        Int            @default(0)
+  ativo        Boolean        @default(true)
+  /// Os dias da semana (0 = domingo) em que o posto não existe, como o bar
+  /// de segunda a sexta. Fechado não pede ninguém e não vira aviso.
+  diasFechados Int[]          @default([])
+
+  fixa  EscalaFixa[]
+  doDia EscalaDoDia[]
+
+  @@map("postos_da_escala")
+}
+
+/// A semana padrão: quem fica em cada posto em cada dia da semana (0 = domingo).
+model EscalaFixa {
+  id             Int           @id @default(autoincrement())
+  postoId        Int
+  posto          PostoDaEscala @relation(fields: [postoId], references: [id], onDelete: Cascade)
+  diaSemana      Int
+  /// Um dos dois: o colaborador ou a empresa terceirizada (o banco confere).
+  colaboradorId  Int?
+  colaborador    Colaborador?  @relation(fields: [colaboradorId], references: [id], onDelete: Cascade)
+  terceirizadoId Int?
+  terceirizado   Terceirizado? @relation(fields: [terceirizadoId], references: [id], onDelete: Cascade)
+
+  @@unique([postoId, diaSemana])
+  @@index([colaboradorId])
+  @@index([terceirizadoId])
+  @@map("escala_fixa")
+}
+
+/// A exceção de uma data: vale por cima da fixa só naquele dia. Pessoa nula =
+/// o posto fica vazio nesse dia.
+model EscalaDoDia {
+  id             Int           @id @default(autoincrement())
+  data           DateTime      @db.Date
+  postoId        Int
+  posto          PostoDaEscala @relation(fields: [postoId], references: [id], onDelete: Cascade)
+  colaboradorId  Int?
+  colaborador    Colaborador?  @relation(fields: [colaboradorId], references: [id], onDelete: SetNull)
+  /// A empresa terceirizada no lugar de um colaborador. Os dois nulos = posto vazio.
+  terceirizadoId Int?
+  terceirizado   Terceirizado? @relation(fields: [terceirizadoId], references: [id], onDelete: SetNull)
+  observacao     String?       @db.VarChar(120)
+  /// O posto fechado só nesta data (um feriado). Falso com o posto fechado
+  /// na semana: abre só nesta data.
+  fechado        Boolean       @default(false)
+
+  @@unique([data, postoId])
+  @@index([colaboradorId])
+  @@index([terceirizadoId])
+  @@map("escala_do_dia")
+}
+
+/// A empresa que manda gente quando falta alguém (garçons terceirizados).
+/// Não é colaborador: não tem férias, ASO, EPI nem folga, e pode estar em
+/// vários postos no mesmo dia (cada posto é uma pessoa da empresa).
+model Terceirizado {
+  id             Int             @id @default(autoincrement())
+  nome           String          @db.VarChar(80)
+  telefone       String?         @db.VarChar(20)
+  /// Quanto cobra por pessoa por dia. Cada posto ocupado é uma pessoa.
+  valorPorPessoa Decimal?        @db.Decimal(10, 2)
+  /// Nulo = manda para as duas áreas.
+  area           AreaDeTrabalho?
+  observacoes    String?         @db.VarChar(500)
+  /// Desativado sai da lista de escolha da escala; o histórico fica.
+  ativo          Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  escalaFixa  EscalaFixa[]
+  escalaDoDia EscalaDoDia[]
+
+  @@index([ativo])
+  @@map("terceirizados")
+}
+
+/// Um pedaço de férias, do primeiro ao último dia (os dois contam).
+model Ferias {
+  id            Int         @id @default(autoincrement())
+  colaboradorId Int
+  colaborador   Colaborador @relation(fields: [colaboradorId], references: [id], onDelete: Cascade)
+  inicio        DateTime    @db.Date
+  fim           DateTime    @db.Date
+  observacao    String?     @db.VarChar(200)
+  createdAt     DateTime    @default(now())
+
+  @@index([colaboradorId])
+  @@index([inicio, fim])
+  @@map("ferias")
+}
+
+/// A projeção do CMO de um mês padrão, registrada no mês em que valeu. O
+/// registro do mês corrente se atualiza a cada mudança (equipe, escala fixa,
+/// encargos); virado o mês, fica o último valor que ele teve.
+model CmoDoMes {
+  /// "2026-10".
+  mes         String   @id @db.VarChar(7)
+  total       Decimal  @db.Decimal(12, 2)
+  clt         Decimal  @db.Decimal(12, 2)
+  fixo        Decimal  @db.Decimal(12, 2)
+  free        Decimal  @db.Decimal(12, 2)
+  /// Faturamento projetado do mês (média semanal × semanas do mês). Nulo sem faturamento digitado.
+  faturamento Decimal? @db.Decimal(12, 2)
+  percentual  Decimal? @db.Decimal(6, 2)
+  /// O total de cada encargo e benefício no mês: [{ nome, natureza, total }].
+  itens       Json     @default("[]")
+  /// Cada pessoa da conta: [{ id, nome, tipo, total }].
+  pessoas     Json
+  updatedAt   DateTime @updatedAt
+
+  @@map("cmo_dos_meses")
+}
+
+/// Os ajustes do Departamento pessoal. Uma linha só (id 1).
+model ConfiguracaoPessoal {
+  id               Int      @id @default(1)
+  /// A meta do CMO em % do faturamento do mês. Nulo = sem meta.
+  metaCmo          Decimal? @db.Decimal(5, 2)
+  /// Quantos domingos seguidos alguém pode trabalhar antes de o seguinte ser folga. Vem da convenção do sindicato. Zero desliga o aviso.
+  domingosSeguidos Int      @default(2)
+
+  @@map("configuracao_pessoal")
+}
+
+enum MotivoDesligamento {
+  PEDIDO_DEMISSAO
+  SEM_JUSTA_CAUSA
+  JUSTA_CAUSA
+  FIM_EXPERIENCIA
+  FIM_CONTRATO
+  ACORDO
+  ABANDONO
+  OUTRO
+}
+
+/// Filho, cônjuge ou outro dependente: para salário-família, imposto de renda e plano.
+model Dependente {
+  id            Int         @id @default(autoincrement())
+  colaboradorId Int
+  colaborador   Colaborador @relation(fields: [colaboradorId], references: [id], onDelete: Cascade)
+  nome          String      @db.VarChar(80)
+  /// "Filho(a)", "Cônjuge", "Outro".
+  parentesco    String      @db.VarChar(20)
+  nascimento    DateTime?   @db.Date
+  cpf           String?     @db.VarChar(11)
+  createdAt     DateTime    @default(now())
+
+  @@index([colaboradorId])
+  @@map("dependentes")
+}
+
+/// Um documento da admissão: entregue (com a foto ou o PDF, quando houver).
+model DocumentoDoColaborador {
+  id            Int         @id @default(autoincrement())
+  colaboradorId Int
+  colaborador   Colaborador @relation(fields: [colaboradorId], references: [id], onDelete: Cascade)
+  /// A chave do checklist ("rg", "ctps").
+  tipo          String      @db.VarChar(40)
+  entregueEm    DateTime    @db.Date
+  /// Não se aplica a esta pessoa (reservista de mulher, certidão de filho de quem não tem).
+  naoSeAplica   Boolean     @default(false)
+  nome          String?     @db.VarChar(160)
+  mime          String?     @db.VarChar(80)
+  tamanho       Int?
+  dados         Bytes?
+  criadoPorId   Int?
+  createdAt     DateTime    @default(now())
+
+  @@unique([colaboradorId, tipo])
+  @@map("documentos_colaborador")
+}
+
+/// Um EPI ou peça de uniforme que a casa entrega: bota, luva térmica, avental.
+model ItemDeEpi {
+  id          Int     @id @default(autoincrement())
+  nome        String  @unique @db.VarChar(60)
+  /// O CA (certificado de aprovação) do EPI, que vai no termo de entrega. Uniforme não tem.
+  ca          String? @db.VarChar(20)
+  /// Em quantos dias a peça costuma ser trocada. Nulo = sem troca prevista.
+  trocaEmDias Int?
+  ativo       Boolean @default(true)
+  ordem       Int     @default(0)
+
+  entregas EntregaDeEpi[]
+
+  @@map("epi_itens")
+}
+
+/// A entrega de um EPI ou uniforme para uma pessoa, com a troca prevista.
+model EntregaDeEpi {
+  id            Int         @id @default(autoincrement())
+  colaboradorId Int
+  colaborador   Colaborador @relation(fields: [colaboradorId], references: [id], onDelete: Cascade)
+  /// Restrict: item com entrega se desliga, não se apaga.
+  itemId        Int
+  item          ItemDeEpi   @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  data          DateTime    @db.Date
+  quantidade    Int         @default(1)
+  tamanho       String?     @db.VarChar(10)
+  /// Data + troca em dias do item, ou a digitada. Nulo = sem troca prevista.
+  proximaTroca  DateTime?   @db.Date
+  /// Marcado na conferência: a peça precisa de troca antes da data.
+  desgastado    Boolean     @default(false)
+  /// Quando outra entrega do mesmo item para a mesma pessoa a substituiu.
+  substituidaEm DateTime?   @db.Date
+  observacao    String?     @db.VarChar(200)
+  createdAt     DateTime    @default(now())
+
+  @@index([colaboradorId])
+  @@index([itemId])
+  @@map("epi_entregas")
+}
+
+/// A lixeira do painel: o lançamento, o insumo e a entrega de EPI apagados
+/// saem da tabela deles (os relatórios nem veem) e ficam guardados aqui por
+/// 30 dias, inteiros, para voltar com o mesmo id. A tarefa tem a lixeira dela.
+model ItemNaLixeira {
+  id         Int      @id @default(autoincrement())
+  /// "lancamento", "insumo" ou "entregaDeEpi".
+  tipo       String   @db.VarChar(30)
+  /// O módulo de quem pode ver e restaurar.
+  modulo     String   @db.VarChar(30)
+  /// "Conta de luz · R$ 320,00": o que a lista mostra.
+  rotulo     String   @db.VarChar(200)
+  /// A linha inteira como estava (e o que ela levava junto, como os anexos).
+  dados      Json
+  apagadoPor String?  @db.VarChar(80)
+  apagadoEm  DateTime @default(now())
+
+  @@index([apagadoEm])
+  @@map("lixeira")
+}
+
+/// O faturamento fechado de um mês, digitado pela casa. É com ele que o CMO
+/// de cada mês vira % do faturamento.
+model FaturamentoDoMes {
+  /// "2026-10".
+  mes       String   @id @db.VarChar(7)
+  valor     Decimal  @db.Decimal(12, 2)
+  updatedAt DateTime @updatedAt
+
+  @@map("faturamentos_do_mes")
+}
+
+enum NaturezaDoItem {
+  ENCARGO
+  BENEFICIO
+  /// Sai do salário do colaborador (INSS dele, sindicato). Não entra no CMO:
+  /// muda o líquido que a pessoa recebe, não o que a casa gasta.
+  DESCONTO
+}
+
+/// Como o valor de um encargo ou benefício vira custo no mês.
+enum FormaDoItem {
+  /// % do salário (CLT e fixo; o free não tem salário).
+  PERCENTUAL_SALARIO
+  /// R$ por pessoa no mês.
+  POR_MES
+  /// R$ por dia trabalhado, pelos dias da escala fixa.
+  POR_DIA
+}
+
+/// Um encargo (13º, FGTS) ou benefício (vale-transporte, plano de saúde) que
+/// entra no CMO. Vale para os tipos marcados; a exceção de uma pessoa fica em
+/// ItemDoColaborador.
+model ItemDeCusto {
+  id        Int            @id @default(autoincrement())
+  nome      String         @unique @db.VarChar(60)
+  natureza  NaturezaDoItem
+  forma     FormaDoItem
+  /// O % (forma PERCENTUAL_SALARIO) ou os R$.
+  valor     Decimal        @db.Decimal(10, 2)
+  /// Quem recebe sem precisar marcar na ficha.
+  tipos     TipoContrato[]
+  ativo     Boolean        @default(true)
+  createdAt DateTime       @default(now())
+
+  excecoes ItemDoColaborador[]
+
+  @@map("itens_de_custo")
+}
+
+/// A exceção de uma pessoa: recebe = true põe o item para quem está fora dos
+/// tipos dele; false tira de quem está dentro.
+model ItemDoColaborador {
+  colaboradorId Int
+  colaborador   Colaborador @relation(fields: [colaboradorId], references: [id], onDelete: Cascade)
+  itemId        Int
+  item          ItemDeCusto @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  recebe        Boolean
+  /// O valor desta pessoa (% ou R$, conforme a forma do item). Nulo = o do cadastro.
+  valor         Decimal?    @db.Decimal(10, 2)
+
+  @@id([colaboradorId, itemId])
+  @@index([itemId])
+  @@map("itens_do_colaborador")
+}
+
+/// Um token para o Claude (ou outro assistente) consultar o app pelo MCP, em
+/// nome de quem o criou e com as permissões dela. Só leitura.
+///
+/// O token em si nunca é guardado: só o sha256 dele, e ele aparece uma vez,
+/// na hora de criar. Revogado ou de conta desligada, não abre nada.
+model TokenDeAcesso {
+  id Int @id @default(autoincrement())
+
+  userId Int
+  user   AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Para a pessoa reconhecer: "Claude do celular".
+  nome String @db.VarChar(60)
+
+  /// sha256 em hexadecimal do token.
+  hash String @unique
+
+  criadoEm   DateTime  @default(now())
+  usadoEm    DateTime?
+  revogadoEm DateTime?
+
+  @@index([userId])
+  @@map("tokens_de_acesso")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Eventos
+// ---------------------------------------------------------------------------
+//
+// O salão alugado à noite para festa, jantar de empresa, formatura. Não toca
+// em reserva: o evento é um módulo à parte, com cliente, cardápio e agenda
+// próprios.
+//
+// Orçamento e evento são o mesmo registro em fases diferentes (`Evento.status`).
+// O que se vende fica em `EventoLinha`, uma cópia dos números no momento do
+// orçamento: se o custo de uma receita mudar depois, o que já foi mandado ao
+// cliente não muda sozinho.
+
+enum TipoCliente {
+  PESSOA
+  EMPRESA
+}
+
+/// Por onde o cliente chegou. É o que diz, com o tempo, onde vale a pena divulgar.
+enum OrigemCliente {
+  INSTAGRAM
+  WHATSAPP
+  INDICACAO
+  CLIENTE_DO_ALMOCO
+  PASSOU_NA_FRENTE
+  SITE
+  OUTRO
+}
+
+enum TipoInteracao {
+  LIGACAO
+  WHATSAPP
+  EMAIL
+  VISITA
+  REUNIAO
+  NOTA
+}
+
+/// A etapa do menu em que o prato entra: é como a proposta agrupa o cardápio.
+/// Fica no item, e não na ficha, porque o mesmo prato é entrada num menu e
+/// principal em outro.
+enum EtapaCardapio {
+  ENTRADA
+  PRINCIPAL
+  ACOMPANHAMENTO
+  SOBREMESA
+  FINGER_FOOD
+  BEBIDA
+  OUTRO
+}
+
+enum StatusEvento {
+  /// Montando o orçamento; o cliente ainda não viu.
+  RASCUNHO
+  /// O cliente recebeu e está decidindo.
+  ENVIADO
+  /// Fechado. A data é do cliente.
+  CONFIRMADO
+  /// Aconteceu.
+  REALIZADO
+  /// O cliente não fechou.
+  PERDIDO
+  /// Fechou e depois desistiu.
+  CANCELADO
+}
+
+enum TipoEvento {
+  ANIVERSARIO
+  CASAMENTO
+  CORPORATIVO
+  FORMATURA
+  CONFRATERNIZACAO
+  RELIGIOSO
+  OUTRO
+}
+
+enum FormatoEvento {
+  /// Jantar à mesa: a lotação é a de lugares sentados.
+  SENTADO
+  /// Coquetel, volante: cabe mais gente que nas mesas.
+  EM_PE
+}
+
+enum MotivoPerda {
+  PRECO
+  DATA_INDISPONIVEL
+  FECHOU_COM_OUTRO
+  DESISTIU
+  SEM_RESPOSTA
+  OUTRO
+}
+
+enum CategoriaLinha {
+  ESPACO
+  CARDAPIO
+  BEBIDA
+  EQUIPE
+  DECORACAO
+  TERCEIRO
+  /// Custo da casa que não aparece na proposta: gás, limpeza, energia.
+  CUSTO_INTERNO
+  OUTRO
+}
+
+enum EtapaChecklist {
+  ANTES
+  NO_DIA
+  DEPOIS
+}
+
+/// Quem contrata evento. Ao contrário da reserva, aqui existe cadastro: evento
+/// tem empresa, CNPJ, mais de uma conversa até fechar, e volta no ano seguinte.
+model ClienteEvento {
+  id   Int         @id @default(autoincrement())
+  nome String      @db.VarChar(100)
+  tipo TipoCliente @default(PESSOA)
+
+  /// CPF ou CNPJ, só dígitos. Opcional: só precisa na hora do contrato ou da nota.
+  documento String?        @db.VarChar(14)
+  /// E.164, a mesma normalização do resto do app.
+  telefone  String?
+  email     String?
+  origem    OrigemCliente?
+
+  observacoes String?
+
+  /// Quando voltar a falar com ele. É o que monta a lista "retornar hoje" da Agenda.
+  proximoContato DateTime? @db.Date
+
+  eventos    Evento[]
+  interacoes InteracaoCliente[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([telefone])
+  @@index([proximoContato])
+  @@map("clientes_evento")
+}
+
+/// O histórico da conversa com o cliente: cada ligação, visita, mensagem.
+model InteracaoCliente {
+  id Int @id @default(autoincrement())
+
+  clienteId Int
+  cliente   ClienteEvento @relation(fields: [clienteId], references: [id], onDelete: Cascade)
+
+  /// O evento de que se falou, quando foi sobre um.
+  eventoId Int?
+  evento   Evento? @relation(fields: [eventoId], references: [id], onDelete: SetNull)
+
+  tipo  TipoInteracao
+  texto String
+  em    DateTime      @default(now())
+
+  /// Quem anotou. Nulo quando a conta foi apagada.
+  autorId Int?
+
+  @@index([clienteId, em(sort: Desc)])
+  @@map("interacoes_cliente")
+}
+
+/// O menu de evento: um conjunto de fichas do Receituário com quanto de cada uma vai por pessoa.
+model Cardapio {
+  id   Int    @id @default(autoincrement())
+  nome String @db.VarChar(100)
+
+  /// O texto que o cliente lê na proposta.
+  descricao String?
+
+  /// Quanto a casa cobra por pessoa. Nulo enquanto o preço não foi decidido.
+  precoPorPessoa Decimal? @db.Decimal(12, 2)
+
+  ativo Boolean @default(true)
+
+  itens   CardapioItem[]
+  eventos Evento[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("cardapios")
+}
+
+model CardapioItem {
+  id Int @id @default(autoincrement())
+
+  cardapioId Int
+  cardapio   Cardapio @relation(fields: [cardapioId], references: [id], onDelete: Cascade)
+
+  /// A receita é a ficha do Receituário, que dá o custo da porção.
+  /// Restrict: ficha usada em cardápio se desliga, não se apaga.
+  fichaId Int
+  ficha   FichaTecnica @relation(fields: [fichaId], references: [id], onDelete: Restrict)
+
+  etapa EtapaCardapio @default(PRINCIPAL)
+
+  /// Quantas porções por convidado: 1 prato principal, 6 salgadinhos.
+  porcoesPorPessoa Decimal @default(1) @db.Decimal(8, 2)
+
+  ordem Int @default(0)
+
+  @@index([cardapioId])
+  @@index([fichaId])
+  @@map("cardapio_itens")
+}
+
+model Evento {
+  id Int @id @default(autoincrement())
+
+  clienteId Int
+  cliente   ClienteEvento @relation(fields: [clienteId], references: [id], onDelete: Restrict)
+
+  /// "Aniversário de 40 anos da Ana", "Confraternização Empresa X".
+  titulo String       @db.VarChar(120)
+  tipo   TipoEvento
+  status StatusEvento @default(RASCUNHO)
+
+  data       DateTime @db.Date
+  /// "HH:MM", como o resto do app. Fim depois da meia-noite vale ("01:00").
+  horaInicio String?  @db.VarChar(5)
+  horaFim    String?  @db.VarChar(5)
+
+  convidados Int
+  formato    FormatoEvento @default(SENTADO)
+
+  /// O cardápio de onde saiu a linha de comida. Só referência: os números
+  /// estão copiados na linha.
+  cardapioId Int?
+  cardapio   Cardapio? @relation(fields: [cardapioId], references: [id], onDelete: SetNull)
+
+  /// Os percentuais deste evento, copiados da configuração ao criar. Mudar a
+  /// configuração depois não reescreve orçamento antigo.
+  ///
+  /// A taxa de serviço vai para a equipe (Lei 13.419): entra no total do
+  /// cliente, mas não na receita da casa.
+  taxaServicoPct Decimal @default(0) @db.Decimal(5, 2)
+  impostoPct     Decimal @default(0) @db.Decimal(5, 2)
+
+  /// Até quando vale o preço mandado.
+  validoAte DateTime? @db.Date
+
+  motivoPerda      MotivoPerda?
+  motivoPerdaTexto String?
+
+  /// O que o cliente lê na proposta, além das linhas.
+  observacoesCliente  String?
+  /// Só para a casa.
+  observacoesInternas String?
+
+  enviadoEm    DateTime?
+  confirmadoEm DateTime?
+  realizadoEm  DateTime?
+  encerradoEm  DateTime?
+
+  linhas     EventoLinha[]
+  pagamentos EventoPagamento[]
+  checklist  EventoChecklistItem[]
+  interacoes InteracaoCliente[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, data])
+  @@index([clienteId])
+  @@index([data])
+  @@map("eventos")
+}
+
+model EventoLinha {
+  id Int @id @default(autoincrement())
+
+  eventoId Int
+  evento   Evento @relation(fields: [eventoId], references: [id], onDelete: Cascade)
+
+  categoria CategoriaLinha
+  descricao String         @db.VarChar(160)
+
+  quantidade Decimal @db.Decimal(10, 2)
+  /// "pessoa", "hora", "un".
+  unidade    String  @default("un") @db.VarChar(20)
+
+  custoUnitario Decimal @default(0) @db.Decimal(12, 2)
+  /// Zero é linha que o cliente não paga à parte (custo interno, cortesia).
+  precoUnitario Decimal @default(0) @db.Decimal(12, 2)
+
+  /// A quantidade é o número de convidados e muda junto com ele.
+  porConvidado Boolean @default(false)
+  /// Veio de "aplicar cardápio". Trocar o cardápio troca estas linhas, e só elas.
+  doCardapio   Boolean @default(false)
+
+  ordem Int @default(0)
+
+  @@index([eventoId])
+  @@map("evento_linhas")
+}
+
+/// O dinheiro que entrou: sinal, parcelas, saldo.
+model EventoPagamento {
+  id Int @id @default(autoincrement())
+
+  eventoId Int
+  evento   Evento @relation(fields: [eventoId], references: [id], onDelete: Cascade)
+
+  valor     Decimal  @db.Decimal(12, 2)
+  data      DateTime @db.Date
+  /// "Pix", "cartão", "dinheiro".
+  forma     String?  @db.VarChar(40)
+  /// "Sinal", "Saldo".
+  descricao String?  @db.VarChar(80)
+
+  createdAt DateTime @default(now())
+
+  @@index([eventoId])
+  @@map("evento_pagamentos")
+}
+
+/// Uma lista que se repete em todo evento, para não depender da memória.
+model ModeloChecklist {
+  id   Int    @id @default(autoincrement())
+  nome String @db.VarChar(80)
+
+  itens ModeloChecklistItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("modelos_checklist")
+}
+
+model ModeloChecklistItem {
+  id Int @id @default(autoincrement())
+
+  modeloId Int
+  modelo   ModeloChecklist @relation(fields: [modeloId], references: [id], onDelete: Cascade)
+
+  texto String         @db.VarChar(160)
+  etapa EtapaChecklist @default(ANTES)
+
+  /// Dias em relação ao evento: -7 é uma semana antes, 0 é no dia, 1 é o dia
+  /// seguinte. Nulo é tarefa sem prazo.
+  dias Int?
+
+  ordem Int @default(0)
+
+  @@index([modeloId])
+  @@map("modelo_checklist_itens")
+}
+
+/// A tarefa de um evento. Copiada do modelo, com o prazo já em data.
+model EventoChecklistItem {
+  id Int @id @default(autoincrement())
+
+  eventoId Int
+  evento   Evento @relation(fields: [eventoId], references: [id], onDelete: Cascade)
+
+  texto       String         @db.VarChar(160)
+  etapa       EtapaChecklist @default(ANTES)
+  prazo       DateTime?      @db.Date
+  responsavel String?        @db.VarChar(60)
+
+  feito   Boolean   @default(false)
+  feitoEm DateTime?
+
+  ordem Int @default(0)
+
+  @@index([eventoId])
+  @@index([feito, prazo])
+  @@map("evento_checklist_itens")
+}
+
+/// Linha única (id = 1), como as outras configurações.
+model ConfiguracaoEventos {
+  id Int @id @default(1)
+
+  /// O lucro que a casa quer sobre o preço, para o preço sugerido.
+  margemAlvoPct  Decimal @default(30) @db.Decimal(5, 2)
+  /// Imposto sobre o faturamento (Simples, por exemplo). Zero até alguém informar.
+  impostoPct     Decimal @default(0) @db.Decimal(5, 2)
+  taxaServicoPct Decimal @default(10) @db.Decimal(5, 2)
+  /// Quanto do total se pede para confirmar a data.
+  sinalPct       Decimal @default(30) @db.Decimal(5, 2)
+  validadeDias   Int     @default(7)
+
+  /// Lotação por formato. O salão tem 40 lugares à mesa; em pé, a casa decide.
+  capacidadeSentados Int  @default(40)
+  capacidadeEmPe     Int?
+
+  /// O valor que entra como "Locação do espaço" em todo orçamento novo.
+  valorLocacao Decimal? @db.Decimal(12, 2)
+
+  /// Condições impressas na proposta: sinal, cancelamento, o que está incluso.
+  condicoes String?
+
+  updatedAt DateTime @updatedAt
+
+  @@map("configuracao_eventos")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Tarefas — setores
+// ---------------------------------------------------------------------------
+
+/// Onde a pessoa trabalha: Cozinha, Salão, Delivery, Financeiro, ADM.
+///
+/// É cadastro, não histórico — como `Category`. Existe por dois motivos que o
+/// papel do usuário não cobre: uma tarefa pode ser atribuída ao SETOR em vez
+/// de à pessoa (a fila que o líder distribui depois, RF-153), e o relatório do
+/// dono é por setor antes de ser por gente.
+///
+/// O líder é opcional porque setor recém-criado ainda não tem um, e obrigar a
+/// escolher na hora do cadastro só faria escolherem errado.
+model Setor {
+  id      Int        @id @default(autoincrement())
+  nome    String     @unique
+  liderId Int?
+  lider   AdminUser? @relation("SetorLider", fields: [liderId], references: [id], onDelete: SetNull)
+
+  ordem     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  pessoas       AdminUser[] @relation("SetorDaPessoa")
+  projetos      Projeto[]
+  tarefas       Tarefa[]    @relation("SetorDaTarefa")
+  tarefasNaFila Tarefa[]    @relation("SetorResponsavel")
+
+  @@index([liderId])
+  @@map("setores")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Tarefas — o quadro
+// ---------------------------------------------------------------------------
+
+/// A ETAPA a que uma coluna pertence, e a razão de existir separada do nome.
+///
+/// O diagnóstico do PRD achou sete projetos com sete conjuntos diferentes de
+/// colunas, e é por isso que nenhum relatório compara projeto com projeto. A
+/// saída não é proibir coluna extra — TREINAMENTO no POP e REVISAR em Eventos
+/// são demanda real — e sim exigir que toda coluna, padrão ou extra, declare a
+/// que etapa ela pertence.
+///
+/// Com isso a coluna REVISAR do Eventos aparece separada dentro do projeto e
+/// somada em "Execução" na comparação entre projetos, que é o que o CA-015
+/// pede.
+///
+/// É também sobre este enum, e não sobre o nome da coluna, que a máquina de
+/// estados decide o que move para onde (`lib/tarefas-fluxo.ts`). Assim coluna
+/// extra ganha as regras certas de graça, sem ninguém cadastrar movimento
+/// nenhum — é o RN-051 caindo da modelagem em vez de virar código.
+enum EstadoColuna {
+  ENTRADA
+  PLANEJADO
+  EXECUCAO
+  EXECUCAO_BLOQUEADA
+  RECORRENTE
+  FINALIZADO_COM_REGISTRO
+  CONCLUIDO
+}
+
+/// Aberta, concluída ou cancelada — e nada mais.
+///
+/// "Em andamento" NÃO é status: é coluna. Misturar os dois é o defeito que o
+/// PRD manda corrigir (RF-175): no TickTick o cartão pode estar na coluna
+/// CONCLUÍDO e continuar aberto, ou marcado como concluído no meio do quadro.
+/// Aqui o status é consequência do estado da coluna de destino, nunca uma
+/// segunda opinião sobre ele.
+enum StatusTarefa {
+  ABERTA
+  CONCLUIDA
+  CANCELADA
+}
+
+/// Os quatro níveis do TickTick, de propósito iguais aos de lá.
+///
+/// Quem migra já tem o hábito e a cor na memória; renomear os quatro ou
+/// inventar um quinto cobraria reaprendizado sem entregar nada.
+enum PrioridadeTarefa {
+  NENHUMA
+  BAIXA
+  MEDIA
+  ALTA
+}
+
+/// O que a pessoa pode fazer DENTRO de um projeto.
+///
+/// Segundo eixo de permissão, e não substituto do primeiro:
+/// `UserModulePermission` decide se ela abre o módulo Tarefas; isto decide o
+/// que ela faz em cada quadro. A matriz completa mora em
+/// `lib/tarefas-permissoes.ts`.
+enum PapelProjeto {
+  GESTOR
+  EDITOR
+  EXECUTOR
+  LEITOR
+}
+
+/// Por que a tarefa não vai acontecer.
+///
+/// Lista fechada porque o "Não farei" do TickTick não pergunta nada, e um ano
+/// depois ninguém sabe se as tarefas morreram por falta de gente, de dinheiro
+/// ou porque alguém as duplicou. Texto livre daria a mesma resposta escrita de
+/// dez jeitos, e o relatório de cancelamentos (8.42) não teria o que agrupar.
+enum MotivoCancelamento {
+  DUPLICADA
+  NAO_E_MAIS_NECESSARIA
+  FORA_DO_ESCOPO
+  SEM_RECURSOS
+  OUTRO
+}
+
+/// De onde veio a ação registrada no log.
+enum OrigemAcao {
+  APP
+  API
+  GATILHO
+  EMAIL
+  IMPORTACAO
+}
+
+/// Um quadro: MANUTENÇÃO, DELIVERY, FINANCEIRO.
+///
+/// Nome único no sistema inteiro. O PRD pede único dentro da pasta (RN-018),
+/// mas pasta é fase seguinte — e enquanto ela não existe, único global é a
+/// leitura conservadora da mesma regra: não cria ambiguidade agora e não
+/// atrapalha a pasta depois.
+model Projeto {
+  id        Int     @id @default(autoincrement())
+  nome      String  @unique
+  descricao String?
+
+  /// Todo projeto tem dono (RN-017). Não é opcional e não vira nulo: quem sai
+  /// da empresa é desativado, nunca apagado, justamente para o quadro não
+  /// ficar órfão.
+  donoId Int
+  dono   AdminUser @relation("ProjetoDono", fields: [donoId], references: [id], onDelete: Restrict)
+
+  setorId Int?
+  setor   Setor? @relation(fields: [setorId], references: [id], onDelete: SetNull)
+
+  /// Privado: só membro vê. Aberto: a empresa inteira lê, só membro edita.
+  privado Boolean @default(false)
+
+  /// O limite de WIP barra o movimento, ou só acende a coluna? (RF-117)
+  ///
+  /// Nasce em "só avisa". Barrar no primeiro dia transformaria uma medida que
+  /// ninguém pediu na primeira coisa que a equipe encontra pela frente — e o
+  /// número do limite ainda é chute declarado: a tabela 10.4 do PRD manda
+  /// revê-lo depois de 30 dias de uso real.
+  wipBloqueia Boolean @default(false)
+
+  /// Arquivado some do menu e continua na busca e nos relatórios (RF-053).
+  /// Data, e não booleano, porque RN-019 exige 30 dias arquivado antes de
+  /// poder excluir — e um booleano não sabe dizer desde quando.
+  arquivadoEm DateTime?
+
+  ordem     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  colunas   Coluna[]
+  membros   MembroProjeto[]
+  tarefas   Tarefa[]
+  etiquetas Etiqueta[]
+
+  @@index([setorId])
+  @@index([donoId])
+  @@map("projetos")
+}
+
+/// Uma etapa do quadro. Padrão da empresa ou extra deste projeto.
+///
+/// `padrao` trava nome e estado contra edição dentro do projeto (RF-061): o
+/// modelo de colunas é decisão da empresa, não de cada gestor, e é o que
+/// mantém os relatórios comparáveis. Coluna extra é livre no nome e escolhe um
+/// dos estados que já existem (RF-062).
+///
+/// `oculta` em vez de excluída (RF-063): o FINANCEIRO não usa LAPIDAR, mas
+/// apagar a coluna dele faria o relatório entre projetos comparar conjuntos
+/// diferentes de etapas — que é o problema que este módulo existe para
+/// resolver.
+model Coluna {
+  id        Int     @id @default(autoincrement())
+  projetoId Int
+  projeto   Projeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  nome   String
+  ordem  Int
+  estado EstadoColuna
+  padrao Boolean      @default(false)
+  oculta Boolean      @default(false)
+
+  /// Máximo de cartões que UMA pessoa pode ter nesta coluna (RF-117). Nulo =
+  /// sem limite. Bloquear ou só avisar é decisão do projeto, não da coluna.
+  wipPorPessoa Int?
+
+  /// Dias parado até o indicador do cartão virar laranja e depois vermelho
+  /// (RF-116). Nulo = não alerta. Os números que vêm no modelo padrão são
+  /// ponto de partida declarado, não medição: o próprio PRD manda reajustá-los
+  /// depois de 30 dias com o relatório de tempo por coluna na mão.
+  alertaLaranjaDias  Int?
+  alertaVermelhoDias Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tarefas        Tarefa[]
+  movimentosDe   MovimentoColuna[] @relation("ColunaOrigem")
+  movimentosPara MovimentoColuna[] @relation("ColunaDestino")
+
+  @@unique([projetoId, nome])
+  @@index([projetoId, ordem])
+  @@map("colunas")
+}
+
+/// Quem participa deste quadro, e como.
+model MembroProjeto {
+  id        Int     @id @default(autoincrement())
+  projetoId Int
+  projeto   Projeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  userId Int
+  user   AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  papel PapelProjeto @default(EXECUTOR)
+
+  createdAt DateTime @default(now())
+
+  @@unique([projetoId, userId])
+  @@index([userId])
+  @@map("membros_projeto")
+}
+
+/// A tarefa. O número curto que se cita em conversa (T-1532) é o próprio id.
+///
+/// O PRD pede um campo `numero` separado (RF-147). Aqui não: todo modelo deste
+/// schema já usa inteiro sequencial como chave, então o id JÁ É o número
+/// curto, e uma segunda coluna guardando o mesmo valor seria peso com risco de
+/// divergir.
+model Tarefa {
+  id Int @id @default(autoincrement())
+
+  projetoId Int
+  projeto   Projeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  colunaId Int
+  coluna   Coluna @relation(fields: [colunaId], references: [id], onDelete: Restrict)
+
+  /// Subtarefa: no máximo três níveis (RF-034). Os cinco do TickTick viram
+  /// labirinto. `nivel` fica gravado, e não calculado subindo a corrente, para
+  /// a recusa do quarto nível ser uma comparação e não uma consulta recursiva.
+  tarefaPaiId Int?
+  tarefaPai   Tarefa?  @relation("Subtarefas", fields: [tarefaPaiId], references: [id], onDelete: Restrict)
+  filhas      Tarefa[] @relation("Subtarefas")
+  nivel       Int      @default(1)
+
+  titulo    String
+  descricao String?
+
+  status StatusTarefa @default(ABERTA)
+
+  /// Só preenchidos quando cancelada (RF-176). O texto acompanha o motivo
+  /// OUTRO e é opcional nos demais.
+  motivoCancelamento MotivoCancelamento?
+  textoCancelamento  String?
+
+  prioridade PrioridadeTarefa @default(NENHUMA)
+
+  /// Uma pessoa, nunca uma etiqueta.
+  ///
+  /// É a coluna que existe para acabar com as tags ALINE, JOEL, Laura e LAUREN
+  /// que o diagnóstico encontrou: tag não notifica, não alimenta "minhas
+  /// tarefas" e não mede nada.
+  ///
+  /// `Restrict`, e não `SetNull`: quem é desligado fica inativo, nunca é
+  /// apagado, e o RF-155 quer que a tarefa dele apareça para o gestor MARCADA
+  /// com o nome de quem era o dono. Um nulo apagaria exatamente a informação
+  /// que interessa.
+  responsavelId Int?
+  responsavel   AdminUser? @relation("TarefaResponsavel", fields: [responsavelId], references: [id], onDelete: Restrict)
+
+  /// A fila do setor: "Cozinha (sem pessoa)", para o líder distribuir depois.
+  setorResponsavelId Int?
+  setorResponsavel   Setor? @relation("SetorResponsavel", fields: [setorResponsavelId], references: [id], onDelete: SetNull)
+
+  /// De que setor é o trabalho — diferente de quem vai fazer. Herda do projeto
+  /// quando ninguém diz o contrário.
+  setorId Int?
+  setor   Setor? @relation("SetorDaTarefa", fields: [setorId], references: [id], onDelete: SetNull)
+
+  /// Data com ou sem hora. O booleano é que diz qual das duas: gravado em UTC
+  /// não há como distinguir "dia 20" de "dia 20 às 00:00", e a diferença
+  /// decide quando a tarefa fica atrasada (RN-023: prazo sem hora vence às
+  /// 23h59 do dia).
+  dataInicio       DateTime?
+  inicioDiaInteiro Boolean   @default(true)
+  prazo            DateTime?
+  prazoDiaInteiro  Boolean   @default(true)
+
+  /// Quantas vezes o prazo foi empurrado (RF-083). Três ou mais acende o
+  /// indicador de "adiada várias vezes" para o gestor (RN-024).
+  qtdAdiamentos Int @default(0)
+
+  /// Obrigatórios na coluna AGUARDANDO (N07, RF-224).
+  ///
+  /// O AGUARDANDO do TickTick é um buraco: o cartão entra e ninguém mais sabe
+  /// o que ele espera nem até quando. Aqui não se entra sem responder as duas
+  /// perguntas, e é da previsão que sai a cobrança automática da fase 4.
+  aguardandoDescricao String?
+  aguardandoPrevisao  DateTime?
+
+  /// O registro que a coluna DOCUMENTADO exige (RN-048).
+  ///
+  /// Por ora só o link — o POP ligado e o anexo marcado como documento são as
+  /// outras duas formas que a regra aceita, e as duas dependem de coisas que
+  /// ainda não existem (o módulo POP e o armazenamento de arquivo). Sem este
+  /// campo, DOCUMENTADO seria uma coluna inalcançável no quadro da MANUTENÇÃO,
+  /// que é justamente o quadro do piloto.
+  documentoUrl String?
+
+  /// Posição manual dentro da coluna.
+  ///
+  /// Decimal para caber um cartão ENTRE dois outros sem renumerar a coluna
+  /// inteira. Nesta fase nada usa isso — o menu "Mover" sempre põe no fim —
+  /// mas a coluna nasce junto porque arrastar chega depois, e mudar o tipo de
+  /// uma tabela cheia custa mais do que criá-la certa.
+  ordem Decimal @default(0) @db.Decimal(20, 10)
+
+  criadoPorId Int
+  criadoPor   AdminUser @relation("TarefaCriador", fields: [criadoPorId], references: [id], onDelete: Restrict)
+  criadoEm    DateTime  @default(now())
+
+  atualizadoPorId Int?
+  atualizadoPor   AdminUser? @relation("TarefaAtualizador", fields: [atualizadoPorId], references: [id], onDelete: Restrict)
+  atualizadoEm    DateTime   @updatedAt
+
+  concluidoPorId Int?
+  concluidoPor   AdminUser? @relation("TarefaConclusor", fields: [concluidoPorId], references: [id], onDelete: Restrict)
+  concluidoEm    DateTime?
+
+  /// Lixeira de 30 dias (RF-179). Depois disso a linha sai de vez — e é por
+  /// isso que `log_atividade` não tem chave estrangeira para cá.
+  excluidoPorId Int?
+  excluidoPor   AdminUser? @relation("TarefaExcluidor", fields: [excluidoPorId], references: [id], onDelete: Restrict)
+  excluidoEm    DateTime?
+
+  /// Para onde a tarefa volta ao ser reaberta (K6). Guardado na conclusão, e
+  /// não deduzido do histórico, porque o caminho de volta tem de existir mesmo
+  /// depois de o log ser arquivado.
+  colunaAnteriorId Int?
+
+  /// Fixada no topo da coluna, desde quando. Data, e não booleano, pelo mesmo
+  /// motivo de `arquivadoEm`: a mais recente fixada vem primeiro, e um
+  /// booleano não sabe dizer qual é. Nulo = não fixada.
+  fixadaEm DateTime?
+
+  movimentos  MovimentoColuna[]
+  comentarios Comentario[]
+  anexos      AnexoTarefa[]
+  etiquetas   TarefaEtiqueta[]
+
+  /// "Minhas" e "Hoje": o que é meu, ainda aberto, ordenado por prazo.
+  @@index([responsavelId, status, prazo])
+  /// O kanban: uma coluna do quadro, na ordem dos cartões.
+  @@index([projetoId, colunaId, ordem])
+  @@index([colunaId])
+  @@index([tarefaPaiId])
+  @@index([setorResponsavelId])
+  @@map("tarefas")
+}
+
+/// Cada passagem de um cartão de uma coluna para outra.
+///
+/// É a matéria-prima do relatório de tempo por coluna e do tempo de ciclo
+/// (8.42) — os dois números que respondem "onde o trabalho empaca?", que é a
+/// pergunta que o TickTick não responde de jeito nenhum. Por isso a tabela
+/// nasce agora, e não na fase que constrói o relatório: dado de tempo não se
+/// reconstrói depois.
+///
+/// Grava o ESTADO além da coluna, e não só o id: a coluna pode ser renomeada,
+/// reordenada ou ocultada depois, e um relatório histórico não pode mudar de
+/// resposta por causa disso. O id serve ao detalhe do projeto; o estado, à
+/// comparação entre projetos.
+model MovimentoColuna {
+  id       Int    @id @default(autoincrement())
+  tarefaId Int
+  tarefa   Tarefa @relation(fields: [tarefaId], references: [id], onDelete: Cascade)
+
+  /// Nulo na criação da tarefa: o primeiro movimento é o nascimento dela, e
+  /// gravá-lo é o que faz o tempo na primeira coluna existir.
+  colunaOrigemId Int?
+  colunaOrigem   Coluna?       @relation("ColunaOrigem", fields: [colunaOrigemId], references: [id], onDelete: SetNull)
+  estadoOrigem   EstadoColuna?
+
+  colunaDestinoId Int?
+  colunaDestino   Coluna?      @relation("ColunaDestino", fields: [colunaDestinoId], references: [id], onDelete: SetNull)
+  estadoDestino   EstadoColuna
+
+  usuarioId Int?
+  usuario   AdminUser? @relation("MovimentoAutor", fields: [usuarioId], references: [id], onDelete: Restrict)
+
+  em DateTime @default(now())
+
+  @@index([tarefaId, em])
+  @@map("movimentos_coluna")
+}
+
+/// Quem fez o quê, quando. Imutável (RN-037).
+///
+/// Polimórfico e SEM chave estrangeira, de propósito. A lixeira apaga a tarefa
+/// de vez depois de 30 dias (RF-179), e uma FK com cascata levaria o histórico
+/// junto — apagando justamente a prova de que a tarefa existiu e de quem a
+/// excluiu. O log tem de sobreviver ao que ele descreve.
+///
+/// Nenhuma ação do sistema edita ou apaga linha daqui, nem para o
+/// administrador. O que não se escreve não precisa ser proibido por permissão.
+model LogAtividade {
+  id Int @id @default(autoincrement())
+
+  /// "tarefa", "projeto", "comentario". Sem FK — ver o parágrafo acima.
+  entidade   String
+  entidadeId Int
+
+  /// "criou", "moveu", "concluiu", "reabriu", "cancelou", "excluiu",
+  /// "restaurou", "alterou", "comentou". Texto e não enum: o vocabulário
+  /// cresce a cada fase, uma migração por verbo novo seria atrito sem ganho, e
+  /// nada decide nada a partir deste campo — ele só é lido.
+  acao String
+
+  /// Preenchidos quando a ação é "alterou". Json para caber data, número,
+  /// texto e nulo sem uma coluna por tipo.
+  campo       String?
+  valorAntes  Json?
+  valorDepois Json?
+
+  /// Nulo quando quem agiu foi o sistema (cron de rotina, gatilho de outro
+  /// módulo). O `origem` diz qual.
+  usuarioId Int?
+  usuario   AdminUser? @relation("LogAutor", fields: [usuarioId], references: [id], onDelete: Restrict)
+
+  origem OrigemAcao @default(APP)
+  em     DateTime   @default(now())
+
+  @@index([entidade, entidadeId, em])
+  @@index([usuarioId, em])
+  @@map("log_atividade")
+}
+
+/// A conversa sobre uma tarefa específica.
+///
+/// Substitui o WhatsApp só nisto: o que se fala sobre ESTA tarefa fica junto
+/// dela, em vez de sumir no meio do grupo. Não substitui o WhatsApp como canal
+/// de conversa.
+model Comentario {
+  id       Int    @id @default(autoincrement())
+  tarefaId Int
+  tarefa   Tarefa @relation(fields: [tarefaId], references: [id], onDelete: Cascade)
+
+  autorId Int
+  autor   AdminUser @relation("ComentarioAutor", fields: [autorId], references: [id], onDelete: Restrict)
+
+  texto String
+
+  /// Responder a um comentário específico (RF-162).
+  respostaAId Int?
+  respostaA   Comentario?  @relation("Respostas", fields: [respostaAId], references: [id], onDelete: SetNull)
+  respostas   Comentario[] @relation("Respostas")
+
+  editadoEm  DateTime?
+  /// Excluído deixa "comentário removido" no lugar (RF-160), em vez de abrir
+  /// um buraco no meio de uma conversa que as respostas ainda referenciam.
+  excluidoEm DateTime?
+
+  criadoEm DateTime @default(now())
+
+  @@index([tarefaId, criadoEm])
+  @@map("comentarios")
+}
+
+// ---------------------------------------------------------------------------
+// Financeiro
+// ---------------------------------------------------------------------------
+//
+// O dinheiro que entra, o que sai e o que sobra. Duas leituras do mesmo
+// lançamento, e é bom não misturar:
+//
+//   - COMPETÊNCIA é o mês a que a receita ou a despesa pertence. A conta de
+//     luz de outubro paga em novembro é custo de outubro. É o que a DRE lê.
+//   - CAIXA é o dia em que o dinheiro mexeu de verdade (`pagoEm`). É o que o
+//     fluxo de caixa e o saldo das contas leem.
+//
+// Saldo nunca é gravado: é o saldo inicial da conta mais o que foi baixado
+// nela. Um número guardado à parte desanda no primeiro erro, e depois ninguém
+// sabe de onde ele veio (é o que acontece com o estoque sem histórico).
+
+enum TipoConta {
+  /// A gaveta do caixa, o cofre.
+  CAIXA
+  BANCO
+  /// Saldo parado na maquininha ou numa conta digital.
+  CARTEIRA
+}
+
+enum TipoLancamento {
+  PAGAR
+  RECEBER
+}
+
+enum StatusLancamento {
+  /// Ainda não mexeu no dinheiro. "Vencido" não é estado: é aberto com o
+  /// vencimento no passado, e a tela calcula.
+  ABERTO
+  PAGO
+  /// Não vai acontecer. Fica para o histórico; não entra em conta nenhuma.
+  CANCELADO
+}
+
+/// De onde o lançamento nasceu. Só MANUAL se apaga; o resto se cancela ou
+/// se corrige na origem.
+enum OrigemLancamento {
+  MANUAL
+  RECORRENCIA
+  FECHAMENTO
+  /// Reservado: pedido de compra recebido (fase 2).
+  COMPRA
+  /// Reservado: pagamento de evento (fase 2).
+  EVENTO
+  /// Criado a partir de uma linha do extrato na conciliação (tarifa, rendimento).
+  EXTRATO
+}
+
+/// A linha da DRE em que a categoria cai. O primeiro nível do plano de
+/// contas é fixo porque é a estrutura do relatório; a casa mexe no segundo
+/// (os subgrupos) e no terceiro (as categorias). A ordem aqui é a do
+/// relatório, e no banco também (os valores novos entram com BEFORE).
+enum GrupoDre {
+  /// Vendas do salão, eventos, delivery.
+  RECEITA_VENDAS
+  /// Receita da operação que não é venda: couvert, rolha, óleo usado.
+  OUTRAS_RECEITAS
+  /// A taxa de serviço é da equipe (Lei 13.419): sai da receita.
+  TAXA_SERVICO
+  /// Impostos sobre a venda (DAS do Simples, ICMS, ISS).
+  IMPOSTOS
+  /// Taxas das maquininhas e comissão dos apps de delivery: custo de vender,
+  /// e não imposto.
+  TAXAS_E_APPS
+  /// Custo da mercadoria vendida: insumos, bebidas, embalagens.
+  CMV
+  PESSOAL
+  /// Aluguel, luz, água, IPTU.
+  OCUPACAO
+  /// Gás, manutenção, limpeza, descartáveis.
+  OPERACIONAL
+  /// Contador, sistemas, tarifas.
+  ADMINISTRATIVO
+  MARKETING
+  /// Juros, tarifas bancárias, rendimentos.
+  FINANCEIRO
+  /// Mexe no caixa mas não é resultado: investimento, retirada de sócio,
+  /// empréstimo.
+  FORA_DO_RESULTADO
+}
+
+enum TipoFormaRecebimento {
+  DINHEIRO
+  PIX
+  DEBITO
+  CREDITO
+  VOUCHER
+  OUTRO
+}
+
+/// Onde o dinheiro fica: a gaveta, o banco, a maquininha.
+model ContaFinanceira {
+  id   Int       @id @default(autoincrement())
+  nome String    @unique @db.VarChar(40)
+  tipo TipoConta
+
+  /// O saldo no dia em que a conta começou a ser controlada aqui. Baixa
+  /// antes dessa data é recusada: ela já está dentro deste número.
+  saldoInicial   Decimal  @default(0) @db.Decimal(12, 2)
+  saldoInicialEm DateTime @db.Date
+
+  /// O código desta conta no plano de contas do escritório de contabilidade
+  /// ("1.1.1.02"). É o que faz a exportação entrar no sistema dele sem
+  /// ninguém redigitar.
+  codigoContabil String? @db.VarChar(20)
+
+  /// A conta como o banco a chama no extrato OFX (ACCTID, "12345-6"). Gravada
+  /// na primeira importação, faz a próxima escolher a conta sozinha.
+  contaNoBanco String? @db.VarChar(40)
+
+  ativo Boolean @default(true)
+
+  extratos           ExtratoImportado[]
+  linhasExtrato      LinhaExtrato[]
+  lancamentos        Lancamento[]
+  formas             FormaRecebimento[]
+  recorrencias       Recorrencia[]
+  transferenciasDe   Transferencia[]    @relation("transferenciaOrigem")
+  transferenciasPara Transferencia[]    @relation("transferenciaDestino")
+
+  createdAt DateTime @default(now())
+
+  @@map("contas_financeiras")
+}
+
+/// O segundo nível do plano de contas, dentro de um grupo da DRE: "Alimentos"
+/// no CMV, "Imóvel" na Ocupação. A casa cria, renomeia, ordena e desliga; o
+/// grupo de um subgrupo não muda (as categorias dele iriam junto para outra
+/// linha da DRE).
+model SubgrupoFinanceiro {
+  id    Int      @id @default(autoincrement())
+  nome  String   @db.VarChar(60)
+  grupo GrupoDre
+  /// A ordem dentro do grupo, que a casa escolhe.
+  ordem Int      @default(0)
+  ativo Boolean  @default(true)
+
+  categorias CategoriaFinanceira[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([grupo, nome])
+  @@map("subgrupos_financeiros")
+}
+
+/// O terceiro nível do plano de contas: "Aluguel", "Hortifrúti", "Contador".
+model CategoriaFinanceira {
+  id    Int            @id @default(autoincrement())
+  /// Único dentro do subgrupo: "Outros" pode existir em mais de um lugar.
+  nome  String         @db.VarChar(60)
+  tipo  TipoLancamento
+  /// Sempre o grupo do subgrupo; fica aqui para a DRE e os relatórios lerem
+  /// direto. Quem grava a categoria copia do subgrupo.
+  grupo GrupoDre
+
+  subgrupoId Int
+  subgrupo   SubgrupoFinanceiro @relation(fields: [subgrupoId], references: [id], onDelete: Restrict)
+  /// A ordem dentro do subgrupo, que a casa escolhe.
+  ordem      Int                @default(0)
+
+  /// As categorias que o próprio sistema usa ao gerar lançamento ("vendas
+  /// do salão", "repasse da taxa de serviço"). Com chave, não se apaga nem
+  /// muda de grupo.
+  chave String? @unique @db.VarChar(40)
+
+  /// O código no plano de contas do escritório, como em `ContaFinanceira`.
+  codigoContabil String? @db.VarChar(20)
+
+  /// O centro que o formulário sugere ao escolher esta categoria. Só
+  /// sugestão: o lançamento guarda o próprio centro.
+  centroPadraoId Int?
+  centroPadrao   CentroCusto? @relation(fields: [centroPadraoId], references: [id], onDelete: SetNull)
+
+  ativo Boolean @default(true)
+
+  lancamentos  Lancamento[]
+  recorrencias Recorrencia[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([subgrupoId, nome])
+  @@index([subgrupoId])
+  @@map("categorias_financeiras")
+}
+
+/// Como o cliente paga no PDV, com a taxa e o prazo da maquininha.
+///
+/// "Crédito Stone" e "Crédito Cielo" são formas diferentes quando a taxa ou
+/// o prazo diferem: é o que faz o recebível cair no dia e no valor certos.
+model FormaRecebimento {
+  id   Int                  @id @default(autoincrement())
+  nome String               @unique @db.VarChar(40)
+  tipo TipoFormaRecebimento
+
+  /// % que a maquininha fica. 0 em dinheiro e Pix.
+  taxaPct   Decimal @default(0) @db.Decimal(5, 2)
+  /// Dias até o dinheiro cair na conta. 0 = na hora (o lançamento já nasce pago).
+  prazoDias Int     @default(0)
+
+  contaId Int
+  conta   ContaFinanceira @relation(fields: [contaId], references: [id], onDelete: Restrict)
+
+  ordem Int     @default(0)
+  ativo Boolean @default(true)
+
+  itens FechamentoItem[]
+
+  createdAt DateTime @default(now())
+
+  @@map("formas_recebimento")
+}
+
+/// Uma conta a pagar ou a receber. Baixa é sempre do valor todo: quem paga
+/// metade divide o lançamento em dois.
+model Lancamento {
+  id Int @id @default(autoincrement())
+
+  tipo      TipoLancamento
+  descricao String         @db.VarChar(120)
+
+  categoriaId Int
+  categoria   CategoriaFinanceira @relation(fields: [categoriaId], references: [id], onDelete: Restrict)
+
+  /// Prevista enquanto aberto; obrigatória na baixa.
+  contaId Int?
+  conta   ContaFinanceira? @relation(fields: [contaId], references: [id], onDelete: Restrict)
+
+  fornecedorId Int?
+  fornecedor   Supplier? @relation(fields: [fornecedorId], references: [id], onDelete: SetNull)
+
+  /// O valor cheio. Na venda no cartão, o bruto.
+  valor Decimal @db.Decimal(12, 2)
+  /// O que a maquininha fica. Entra na DRE como dedução; o que cai na conta
+  /// é `valor - taxa`.
+  taxa  Decimal @default(0) @db.Decimal(12, 2)
+
+  vencimento  DateTime @db.Date
+  /// O primeiro dia do mês a que pertence.
+  competencia DateTime @db.Date
+
+  status StatusLancamento @default(ABERTO)
+
+  pagoEm     DateTime? @db.Date
+  /// O que mexeu na conta: valor - taxa + juros - desconto.
+  valorPago  Decimal?  @db.Decimal(12, 2)
+  jurosMulta Decimal   @default(0) @db.Decimal(12, 2)
+  desconto   Decimal   @default(0) @db.Decimal(12, 2)
+
+  /// Número da nota, do boleto.
+  documento  String? @db.VarChar(60)
+  observacao String?
+
+  /// 1 de 3, 2 de 3... Todas as parcelas dividem o mesmo `grupoParcelas`.
+  parcela       Int?
+  totalParcelas Int?
+  grupoParcelas String? @db.VarChar(36)
+
+  recorrenciaId Int?
+  recorrencia   Recorrencia? @relation(fields: [recorrenciaId], references: [id], onDelete: SetNull)
+
+  fechamentoId Int?
+  fechamento   FechamentoDoDia? @relation(fields: [fechamentoId], references: [id], onDelete: Cascade)
+
+  origem   OrigemLancamento @default(MANUAL)
+  /// O id na origem (pedido de compra, pagamento de evento), quando houver.
+  origemId Int?
+
+  /// A área da casa a que o lançamento pertence. Nulo = "sem centro", que a
+  /// DRE por centro mostra em coluna própria em vez de esconder.
+  centroCustoId Int?
+  centroCusto   CentroCusto? @relation(fields: [centroCustoId], references: [id], onDelete: SetNull)
+
+  criadoPorId  Int?
+  criadoPor    AdminUser? @relation("lancamentoCriadoPor", fields: [criadoPorId], references: [id], onDelete: SetNull)
+  baixadoPorId Int?
+  baixadoPor   AdminUser? @relation("lancamentoBaixadoPor", fields: [baixadoPorId], references: [id], onDelete: SetNull)
+
+  /// A nota, o boleto, o comprovante. É o que o contador pede junto.
+  anexos AnexoFinanceiro[]
+
+  /// A linha do extrato que confirma este lançamento. Várias podem apontar
+  /// para a mesma: o depósito da maquininha junta as vendas de vários cartões.
+  linhaExtratoId Int?
+  linhaExtrato   LinhaExtrato? @relation(fields: [linhaExtratoId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// A recorrência gera um lançamento por mês, e gerar de novo não duplica.
+  @@unique([recorrenciaId, competencia])
+  @@index([status, vencimento])
+  @@index([competencia])
+  @@index([pagoEm])
+  @@index([fechamentoId])
+  @@index([centroCustoId])
+  @@map("lancamentos")
+}
+
+/// A despesa (ou receita) que se repete todo mês: aluguel, contador, internet.
+model Recorrencia {
+  id Int @id @default(autoincrement())
+
+  tipo      TipoLancamento @default(PAGAR)
+  descricao String         @db.VarChar(120)
+
+  categoriaId Int
+  categoria   CategoriaFinanceira @relation(fields: [categoriaId], references: [id], onDelete: Restrict)
+
+  contaId Int?
+  conta   ContaFinanceira? @relation(fields: [contaId], references: [id], onDelete: Restrict)
+
+  fornecedorId Int?
+  fornecedor   Supplier? @relation(fields: [fornecedorId], references: [id], onDelete: SetNull)
+
+  /// O valor de referência. A conta de luz muda todo mês: o lançamento
+  /// gerado se edita antes de pagar.
+  valor         Decimal @db.Decimal(12, 2)
+  /// 1 a 31. Em mês mais curto, cai no último dia.
+  diaVencimento Int
+
+  /// Primeiro e último mês (primeiro dia de cada). Sem fim = até desligar.
+  inicio DateTime  @db.Date
+  fim    DateTime? @db.Date
+
+  centroCustoId Int?
+  centroCusto   CentroCusto? @relation(fields: [centroCustoId], references: [id], onDelete: SetNull)
+
+  ativo Boolean @default(true)
+
+  lancamentos Lancamento[]
+
+  createdAt DateTime @default(now())
+
+  @@map("recorrencias")
+}
+
+/// O fechamento do PDV de um dia: quanto entrou em cada forma de pagamento.
+/// Cada item vira um lançamento a receber, com a taxa e o prazo da forma.
+model FechamentoDoDia {
+  id   Int      @id @default(autoincrement())
+  data DateTime @unique @db.Date
+
+  /// A taxa de serviço que veio dentro dos valores acima. É da equipe: vira
+  /// um repasse a pagar e sai da receita.
+  taxaServico Decimal @default(0) @db.Decimal(12, 2)
+  observacao  String?
+
+  criadoPorId Int?
+  criadoPor   AdminUser? @relation(fields: [criadoPorId], references: [id], onDelete: SetNull)
+
+  itens       FechamentoItem[]
+  lancamentos Lancamento[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("fechamentos_do_dia")
+}
+
+model FechamentoItem {
+  id Int @id @default(autoincrement())
+
+  fechamentoId Int
+  fechamento   FechamentoDoDia @relation(fields: [fechamentoId], references: [id], onDelete: Cascade)
+
+  formaId Int
+  forma   FormaRecebimento @relation(fields: [formaId], references: [id], onDelete: Restrict)
+
+  valorBruto Decimal @db.Decimal(12, 2)
+
+  @@unique([fechamentoId, formaId])
+  @@map("fechamento_itens")
+}
+
+/// Dinheiro que muda de conta sem entrar nem sair da casa: a gaveta
+/// depositada no banco, o saldo da maquininha transferido.
+model Transferencia {
+  id Int @id @default(autoincrement())
+
+  origemId  Int
+  origem    ContaFinanceira @relation("transferenciaOrigem", fields: [origemId], references: [id], onDelete: Restrict)
+  destinoId Int
+  destino   ContaFinanceira @relation("transferenciaDestino", fields: [destinoId], references: [id], onDelete: Restrict)
+
+  valor      Decimal  @db.Decimal(12, 2)
+  data       DateTime @db.Date
+  observacao String?  @db.VarChar(120)
+
+  criadoPorId Int?
+  criadoPor   AdminUser? @relation(fields: [criadoPorId], references: [id], onDelete: SetNull)
+
+  /// As linhas de extrato que mostram esta transferência (uma em cada banco).
+  linhasExtrato LinhaExtrato[]
+
+  createdAt DateTime @default(now())
+
+  @@index([data])
+  @@map("transferencias")
+}
+
+/// Uma área da casa com resultado próprio: Salão, Eventos, Delivery e o
+/// Administrativo, que é o custo comum. Não há rateio: o custo comum aparece
+/// na coluna dele, e não espalhado por um critério que ninguém confere.
+model CentroCusto {
+  id   Int    @id @default(autoincrement())
+  nome String @unique @db.VarChar(40)
+
+  /// Os que o sistema usa: SALAO recebe as vendas do fechamento do dia.
+  chave String? @unique @db.VarChar(20)
+
+  ativo Boolean @default(true)
+
+  lancamentos  Lancamento[]
+  recorrencias Recorrencia[]
+  categorias   CategoriaFinanceira[]
+
+  createdAt DateTime @default(now())
+
+  @@map("centros_custo")
+}
+
+/// Um arquivo de um lançamento: PDF do boleto, foto da nota, XML da NF-e.
+///
+/// Mora no próprio banco, e não num serviço de arquivos, por decisão da casa:
+/// sem conta nova para manter. O limite de 4 MB por arquivo é o da Vercel
+/// para o corpo de uma requisição, e foto de celular é reduzida no navegador
+/// antes de subir. As listas nunca leem `dados`; só a rota de download.
+model AnexoFinanceiro {
+  id Int @id @default(autoincrement())
+
+  lancamentoId Int
+  lancamento   Lancamento @relation(fields: [lancamentoId], references: [id], onDelete: Cascade)
+
+  nome    String @db.VarChar(160)
+  /// O tipo conferido pelos primeiros bytes do arquivo, e não o que o
+  /// navegador disse.
+  mime    String @db.VarChar(80)
+  tamanho Int
+  dados   Bytes
+
+  criadoPorId Int?
+  criadoPor   AdminUser? @relation(fields: [criadoPorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([lancamentoId])
+  @@map("anexos_financeiros")
+}
+
+/// Um mês entregue ao contador. Fechado, nada que mude os números dele se
+/// grava (lançamento, baixa, estorno, fechamento do dia, transferência): o
+/// que o escritório recebeu continua batendo com o sistema. Reabrir é uma
+/// decisão de quem configura o módulo.
+model MesFechado {
+  /// "2026-10".
+  mes String @id @db.VarChar(7)
+
+  fechadoEm    DateTime   @default(now())
+  fechadoPorId Int?
+  fechadoPor   AdminUser? @relation(fields: [fechadoPorId], references: [id], onDelete: SetNull)
+
+  @@map("meses_fechados")
+}
+
+enum StatusLinhaExtrato {
+  /// Ainda não se sabe a que lançamento corresponde.
+  PENDENTE
+  /// Ligada a lançamento(s) ou a uma transferência.
+  CONCILIADA
+  /// Não precisa de lançamento (um estorno do próprio banco que se anula no
+  /// mesmo dia, por exemplo).
+  IGNORADA
+}
+
+/// Um arquivo OFX importado numa conta.
+model ExtratoImportado {
+  id Int @id @default(autoincrement())
+
+  contaId Int
+  conta   ContaFinanceira @relation(fields: [contaId], references: [id], onDelete: Restrict)
+
+  arquivo    String    @db.VarChar(160)
+  de         DateTime? @db.Date
+  ate        DateTime? @db.Date
+  /// O saldo que o banco informa no arquivo, e o dia dele. É o que a tela
+  /// compara com o saldo calculado pelo sistema.
+  saldoFinal Decimal?  @db.Decimal(12, 2)
+  saldoEm    DateTime? @db.Date
+
+  criadoPorId Int?
+  criadoPor   AdminUser? @relation(fields: [criadoPorId], references: [id], onDelete: SetNull)
+
+  linhas LinhaExtrato[]
+
+  createdAt DateTime @default(now())
+
+  @@index([contaId, createdAt])
+  @@map("extratos_importados")
+}
+
+/// Uma transação do extrato do banco, à espera de ser casada com o que foi
+/// lançado. Importar o mesmo arquivo de novo não duplica: a chave é única
+/// por conta.
+model LinhaExtrato {
+  id Int @id @default(autoincrement())
+
+  extratoId Int
+  extrato   ExtratoImportado @relation(fields: [extratoId], references: [id], onDelete: Cascade)
+
+  contaId Int
+  conta   ContaFinanceira @relation(fields: [contaId], references: [id], onDelete: Restrict)
+
+  /// FITID + data + valor (ver `lib/ofx.ts`).
+  chave     String   @db.VarChar(200)
+  data      DateTime @db.Date
+  /// Com sinal: entrada positiva, saída negativa.
+  valor     Decimal  @db.Decimal(12, 2)
+  descricao String   @db.VarChar(200)
+
+  status StatusLinhaExtrato @default(PENDENTE)
+
+  lancamentos Lancamento[]
+
+  transferenciaId Int?
+  transferencia   Transferencia? @relation(fields: [transferenciaId], references: [id], onDelete: SetNull)
+
+  /// O que a conciliação desta linha fez, para desfazer sem adivinhar: os
+  /// lançamentos que ela baixou (voltam a abrir) e se a transferência foi
+  /// criada por ela (é apagada) ou já existia (só se desliga).
+  baixou             Int[]   @default([])
+  criouTransferencia Boolean @default(false)
+
+  @@unique([contaId, chave])
+  @@index([contaId, status, data])
+  @@map("linhas_extrato")
+}
+
+/// Como um item da nota de mercado vira produto da casa.
+///
+/// A nota diz "ALHO TRIT POTE 1KG" com o código do mercado; a casa chama de
+/// "Alho triturado pote 1kg". Vinculado uma vez, o sistema lembra: na próxima
+/// nota do mesmo mercado (pelo CNPJ) o item já vem ligado. `produtoId` nulo é
+/// "não é da casa" (sacola, item pessoal): a próxima nota pula o item.
+///
+/// `fator`: quantas unidades da casa vêm em uma unidade da nota. O mercado
+/// vende "1 UN" de um pote de 1 kg, e a casa conta em KG: fator 1. Um fardo
+/// de 12 latas que a casa conta em UN: fator 12.
+model VinculoNota {
+  id Int @id @default(autoincrement())
+
+  /// Só os dígitos.
+  emitenteCnpj String @db.VarChar(14)
+
+  /// O código do item na nota, ou a descrição normalizada quando ele não tem
+  /// código. É o que identifica o item no mesmo mercado.
+  chave String @db.VarChar(160)
+
+  /// A descrição como veio na nota, para mostrar.
+  descricao String @db.VarChar(160)
+
+  produtoId Int?
+  produto   Product? @relation(fields: [produtoId], references: [id], onDelete: Cascade)
+
+  fator Decimal @default(1) @db.Decimal(12, 4)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([emitenteCnpj, chave])
+  @@index([produtoId])
+  @@map("vinculos_nota")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Tarefas — anexos e etiquetas
+// ---------------------------------------------------------------------------
+
+/// Um arquivo da tarefa: a foto do serviço feito, o PDF do orçamento.
+///
+/// Mesmo desenho de `AnexoFinanceiro`, de propósito: mora no próprio banco,
+/// sem conta nova de armazenamento para manter, com teto de 4 MB por arquivo
+/// (o corpo de uma requisição na Vercel) e foto de celular reduzida no
+/// navegador antes de subir. As telas nunca leem `dados`; só a rota de
+/// download, que confere se a pessoa enxerga o quadro.
+///
+/// Sai junto com a tarefa (CASCADE) quando a lixeira for esvaziada de vez. Na
+/// lixeira de 30 dias a linha da tarefa continua existindo, e o anexo também.
+model AnexoTarefa {
+  id Int @id @default(autoincrement())
+
+  tarefaId Int
+  tarefa   Tarefa @relation(fields: [tarefaId], references: [id], onDelete: Cascade)
+
+  nome    String @db.VarChar(160)
+  /// O tipo conferido pelos primeiros bytes do arquivo, e não o que o
+  /// navegador disse (`detectarTipo` em `lib/anexos.ts`).
+  mime    String @db.VarChar(80)
+  tamanho Int
+  dados   Bytes
+
+  criadoPorId Int
+  criadoPor   AdminUser @relation("AnexoTarefaAutor", fields: [criadoPorId], references: [id], onDelete: Restrict)
+  criadoEm    DateTime  @default(now())
+
+  @@index([tarefaId])
+  @@map("anexos_tarefa")
+}
+
+/// Uma etiqueta do quadro: "elétrica", "fornecedor", "urgente do cliente".
+///
+/// É do QUADRO, e não da empresa inteira: a etiqueta que a MANUTENÇÃO precisa
+/// não tem por que aparecer na lista do FINANCEIRO, e foi a lista global do
+/// TickTick que juntou quatro nomes de gente no meio das etiquetas de
+/// verdade.
+///
+/// Etiqueta nunca é pessoa (RN-020). Quem faz é `Tarefa.responsavelId`; a
+/// recusa de nome de pessoa mora em `lib/tarefas-etiquetas.ts`, conferida na
+/// ação, porque é lá que dá para dizer a quem digitou onde a pessoa vai.
+model Etiqueta {
+  id Int @id @default(autoincrement())
+
+  projetoId Int
+  projeto   Projeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  nome String @db.VarChar(30)
+
+  criadoPorId Int
+  criadoPor   AdminUser @relation("EtiquetaAutor", fields: [criadoPorId], references: [id], onDelete: Restrict)
+  criadoEm    DateTime  @default(now())
+
+  tarefas TarefaEtiqueta[]
+
+  @@unique([projetoId, nome])
+  @@map("etiquetas")
+}
+
+/// Qual etiqueta está em qual tarefa.
+model TarefaEtiqueta {
+  tarefaId   Int
+  tarefa     Tarefa   @relation(fields: [tarefaId], references: [id], onDelete: Cascade)
+  etiquetaId Int
+  etiqueta   Etiqueta @relation(fields: [etiquetaId], references: [id], onDelete: Cascade)
+
+  @@id([tarefaId, etiquetaId])
+  @@index([etiquetaId])
+  @@map("tarefa_etiquetas")
+}
+
+// ---------------------------------------------------------------------------
+// Cardápio buffet: o self-service do almoço, planejado por custo/kg.
+//
+// Veio da planilha ESTRUTURA_CARDÁPIO_BUFFET_NOVO: pratos com custo por kg
+// das fichas técnicas, um cardápio-modelo de segunda a domingo que vale o
+// trimestre, o roteiro da cozinha por dia, o mapa do buffet e o fluxo do
+// forno combinado. Sem quantidade a produzir por enquanto (decisão do dono):
+// o custo é por kg, e o CMV do dia fica para quando houver quantidade.
+// ---------------------------------------------------------------------------
+
+/// Onde o prato é feito.
+enum PostoBuffet {
+  FORNO_COMBINADO
+  /// Uma etapa fora do forno (chapa, panela, mexedura) antes de finalizar no combinado.
+  COMBINADO_APOIO
+  FOGAO_FRITADEIRA
+  PRACA_FRIA
+}
+
+/// O patamar de carga do forno combinado em que o prato entra.
+enum CargaForno {
+  DEFUMACAO
+  NOTURNO
+  VAPOR
+  BRASEADO
+  MEDIO
+  ASSADO
+  AR_SECO
+  SEM_FORNO
+}
+
+/// A janela do dia (ou da véspera) em que o prato é produzido.
+enum JanelaProducao {
+  D1_VESPERA
+  D1_NOITE
+  J1
+  J2
+  J3
+  J4_SERVICO
+  J5_POS_SERVICO
+}
+
+/// Quanto do preparo cabe no forno combinado.
+enum ViabilidadeForno {
+  TOTAL
+  PARCIAL
+  NAO_RECOMENDADO
+  NAO_APLICAVEL
+}
+
+/// A cor do prato no cardápio: verde = 100% no combinado, azul = parcial.
+enum CorForno {
+  VERDE
+  AZUL
+  NENHUMA
+}
+
+enum FormaDaPosicao {
+  RETANGULO
+  CIRCULO
+  OVAL
+}
+
+/// A estação do buffet: Saladas, Proteínas, Pratos quentes, Sobremesas.
+model GrupoBuffet {
+  id          Int      @id @default(autoincrement())
+  nome        String   @unique @db.VarChar(40)
+  /// A ordem no percurso do cliente (anti-horário, começa nas saladas) e na tela.
+  ordem       Int      @default(0)
+  /// Cor da faixa do grupo no mapa e nas listas, em hex ("#22b14c").
+  cor         String   @default("#1f6f43") @db.VarChar(9)
+  /// Quantas posições (cubas) o grupo tem no buffet: o tamanho da lista do dia.
+  posicoes    Int      @default(10)
+  /// O custo/kg-alvo do grupo. O prato acima dele ganha alerta.
+  metaCustoKg Decimal? @db.Decimal(10, 2)
+
+  /// Onde a estação fica no desenho do mapa (grade de 2 colunas da página).
+  mapaLinha   Int @default(1)
+  mapaColuna  Int @default(1)
+  mapaLargura Int @default(2)
+  /// Quantas colunas a grade das posições desta estação tem.
+  mapaColunas Int @default(6)
+
+  pratos       PratoBuffet[]
+  itens        CardapioBuffetItem[]
+  trocas       TrocaDoDiaBuffet[]
+  posicoesMapa PosicaoDoMapa[]
+
+  @@map("buffet_grupos")
+}
+
+/// O prato do buffet com o custo por kg da ficha técnica.
+model PratoBuffet {
+  id     Int     @id @default(autoincrement())
+  /// O código da planilha ("PRT-001"). Opcional para prato novo.
+  codigo String? @unique @db.VarChar(20)
+  nome   String  @unique @db.VarChar(100)
+
+  grupoId   Int
+  grupo     GrupoBuffet @relation(fields: [grupoId], references: [id], onDelete: Restrict)
+  /// Dentro do grupo: "Frituras", "Bovino", "Folhas".
+  categoria String?     @db.VarChar(40)
+  unidade   String      @default("kg") @db.VarChar(10)
+
+  /// Nulo enquanto a ficha não deu o custo.
+  custoKg     Decimal? @db.Decimal(10, 4)
+  /// O código da ficha técnica de onde veio o custo ("264C").
+  codFicha    String?  @db.VarChar(20)
+  /// As ressalvas do custo: preço estimado, rendimento, óleo de fritura...
+  alertaCusto String?
+
+  // O forno combinado (aba 4. FLUXO da planilha). Tudo opcional: prato sem
+  // fluxo definido aparece como "sem fluxo" na tela do forno.
+  viabilidade ViabilidadeForno?
+  modo        String?           @db.VarChar(60)
+  temperatura String?           @db.VarChar(30)
+  umidade     String?           @db.VarChar(30)
+  tempo       String?           @db.VarChar(40)
+  sonda       String?           @db.VarChar(20)
+  posto       PostoBuffet?
+  carga       CargaForno?
+  janela      JanelaProducao?
+  ajuste      String?
+  corForno    CorForno          @default(NENHUMA)
+  defumar     Boolean           @default(false)
+  /// O que se adianta na véspera, quando há.
+  processoD1  String?           @db.VarChar(200)
+
+  ativo Boolean @default(true)
+
+  itens  CardapioBuffetItem[]
+  trocas TrocaDoDiaBuffet[]
+  pesos  PesoDoDiaBuffet[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([grupoId, ativo])
+  @@map("buffet_pratos")
+}
+
+/// O cardápio-modelo de segunda a domingo, que vale um período (o trimestre).
+model CardapioBuffet {
+  id     Int      @id @default(autoincrement())
+  nome   String   @db.VarChar(60)
+  inicio DateTime @db.Date
+  fim    DateTime @db.Date
+
+  dias  CardapioBuffetDia[]
+  itens CardapioBuffetItem[]
+
+  createdAt DateTime @default(now())
+
+  @@index([inicio, fim])
+  @@map("buffet_cardapios")
+}
+
+/// O tema de cada dia da semana do modelo ("Alemã", "Italiana").
+model CardapioBuffetDia {
+  cardapioId Int
+  cardapio   CardapioBuffet @relation(fields: [cardapioId], references: [id], onDelete: Cascade)
+  /// 1 = segunda ... 7 = domingo.
+  diaSemana  Int
+  tema       String?        @db.VarChar(40)
+
+  @@id([cardapioId, diaSemana])
+  @@map("buffet_cardapio_dias")
+}
+
+/// Um prato numa posição de um grupo, num dia da semana do modelo.
+model CardapioBuffetItem {
+  id         Int            @id @default(autoincrement())
+  cardapioId Int
+  cardapio   CardapioBuffet @relation(fields: [cardapioId], references: [id], onDelete: Cascade)
+  diaSemana  Int
+  grupoId    Int
+  grupo      GrupoBuffet    @relation(fields: [grupoId], references: [id], onDelete: Restrict)
+  /// O número da cuba no buffet (o "Nº" da planilha e do mapa).
+  posicao    Int
+  pratoId    Int
+  prato      PratoBuffet    @relation(fields: [pratoId], references: [id], onDelete: Restrict)
+
+  @@unique([cardapioId, diaSemana, grupoId, posicao])
+  @@index([pratoId])
+  @@map("buffet_cardapio_itens")
+}
+
+/// A troca de um dia só, sem mexer no modelo (a coluna ALTERAÇÕES).
+model TrocaDoDiaBuffet {
+  id      Int          @id @default(autoincrement())
+  data    DateTime     @db.Date
+  grupoId Int
+  grupo   GrupoBuffet  @relation(fields: [grupoId], references: [id], onDelete: Restrict)
+  posicao Int
+  /// Nulo: a posição fica sem prato naquele dia.
+  pratoId Int?
+  prato   PratoBuffet? @relation(fields: [pratoId], references: [id], onDelete: Restrict)
+  motivo  String?      @db.VarChar(200)
+
+  criadoPorId Int?
+  createdAt   DateTime @default(now())
+
+  @@unique([data, grupoId, posicao])
+  @@map("buffet_trocas")
+}
+
+/// Uma cuba no desenho do mapa: forma e lugar na grade da estação.
+model PosicaoDoMapa {
+  id      Int            @id @default(autoincrement())
+  grupoId Int
+  grupo   GrupoBuffet    @relation(fields: [grupoId], references: [id], onDelete: Cascade)
+  numero  Int
+  forma   FormaDaPosicao @default(RETANGULO)
+  linha   Int
+  coluna  Int
+  largura Int            @default(1)
+  altura  Int            @default(1)
+
+  @@unique([grupoId, numero])
+  @@map("buffet_mapa_posicoes")
+}
+
+/// Os parâmetros do buffet e da operação do forno. Uma linha só (id 1).
+model ConfiguracaoBuffet {
+  id Int @id @default(1)
+
+  /// Peso do prato no custo/kg do dia a partir do qual é Classe A e B.
+  limiteClasseA Decimal @default(0.05) @db.Decimal(5, 4)
+  limiteClasseB Decimal @default(0.02) @db.Decimal(5, 4)
+
+  /// "07:30". Horários da operação, como texto HH:MM.
+  inicioTurno        String @default("07:30") @db.VarChar(5)
+  aberturaBuffet     String @default("11:00") @db.VarChar(5)
+  encerramentoBuffet String @default("13:30") @db.VarChar(5)
+  fimTurno           String @default("15:00") @db.VarChar(5)
+  inicioVespera      String @default("14:00") @db.VarChar(5)
+
+  fornos              Int @default(1)
+  gnPorForno          Int @default(10)
+  cozinheiros         Int @default(4)
+  cicloDefumacaoHoras Int @default(4)
+  cicloLimpezaMin     Int @default(60)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("buffet_configuracao")
+}
+
+/// O peso de um prato num dia: quanto a cozinha fez e quanto sobrou. É o que
+/// transforma a média simples do custo/kg em custo real do dia e desperdício.
+/// Uma linha por posição do buffet na data, como a troca.
+model PesoDoDiaBuffet {
+  id      Int         @id @default(autoincrement())
+  data    DateTime    @db.Date
+  grupoId Int
+  posicao Int
+  pratoId Int
+  prato   PratoBuffet @relation(fields: [pratoId], references: [id], onDelete: Restrict)
+
+  kgProduzido Decimal  @db.Decimal(8, 3)
+  kgSobra     Decimal? @db.Decimal(8, 3)
+  /// O custo/kg do prato no dia do lançamento: mudar a ficha depois não
+  /// reescreve o custo de um dia que já passou.
+  custoKg     Decimal? @db.Decimal(10, 4)
+
+  lancadoPorId Int?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([data, grupoId, posicao])
+  @@index([data])
+  @@map("buffet_pesos")
+}
+
+/// Quantos clientes o buffet atendeu no dia, para o custo por cliente.
+model ClientesDoDiaBuffet {
+  data      DateTime @id @db.Date
+  clientes  Int
+  updatedAt DateTime @updatedAt
+
+  @@map("buffet_clientes_do_dia")
+}
+
+/// O que uma sugestão do buffet pede para mudar.
+enum TipoSugestaoBuffet {
+  /// Um prato numa posição do cardápio-modelo.
+  CARDAPIO
+  /// A troca de um prato só num dia.
+  TROCA
+  /// Voltar a posição de um dia ao prato do cardápio.
+  DESFAZER_TROCA
+  /// Um prato novo no cadastro.
+  PRATO_NOVO
+  /// Mudar o cadastro de um prato.
+  PRATO
+  /// Ligar ou desligar um prato.
+  LIGAR_PRATO
+}
+
+/// Uma mudança no buffet feita por quem não configura o módulo: só vale
+/// depois que alguém que configura aprova. `dados` guarda o pedido como a
+/// ação o recebeu, e aprovar roda a mesma ação, com as mesmas checagens.
+model SugestaoBuffet {
+  id     Int                @id @default(autoincrement())
+  tipo   TipoSugestaoBuffet
+  status ProdutoNovoStatus  @default(PENDENTE)
+  dados  Json
+  /// "Segunda · Saladas 3: Ovo Cozido → Beterraba Fatiada", para a lista.
+  resumo String             @db.VarChar(300)
+
+  // Onde a sugestão mexe, para marcar na tela certa.
+  cardapioId Int?
+  data       DateTime? @db.Date
+  diaSemana  Int?
+  grupoId    Int?
+  posicao    Int?
+  pratoId    Int?
+
+  criadoPorId   Int?
+  criadoPor     AdminUser? @relation("sugestaoBuffetCriadaPor", fields: [criadoPorId], references: [id], onDelete: SetNull)
+  decididoPorId Int?
+  decididoPor   AdminUser? @relation("sugestaoBuffetDecididaPor", fields: [decididoPorId], references: [id], onDelete: SetNull)
+  decididoEm    DateTime?
+  motivoRecusa  String?    @db.VarChar(200)
+
+  createdAt DateTime @default(now())
+
+  @@index([status])
+  @@map("buffet_sugestoes")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Operacional — o que cada função faz, os processos e o treinamento
+// ---------------------------------------------------------------------------
+
+/// Em que parte do dia a tarefa do checklist acontece.
+enum MomentoDoChecklist {
+  ABERTURA
+  FECHAMENTO
+}
+
+/// O passo a passo de um trabalho da casa, em texto (o POP).
+model Processo {
+  id          Int       @id @default(autoincrement())
+  titulo      String    @db.VarChar(120)
+  objetivo    String?
+  /// Os passos, em ordem.
+  passos      String[]
+  observacoes String?
+  ativo       Boolean   @default(true)
+  /// Quando alguém conferiu que o texto ainda vale.
+  revisadoEm  DateTime? @db.Date
+
+  obrigatorio  ProcessoDaFuncao[]
+  treinamentos Treinamento[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("operacional_processos")
+}
+
+/// Um lugar da casa onde o checklist acontece: Salão, Cozinha geral,
+/// Estoque, Bar, Banheiro, Delivery. É lugar, não setor de pessoas (esse é o
+/// `Setor` das Tarefas).
+model ChecklistDepartamento {
+  id        Int              @id @default(autoincrement())
+  nome      String           @unique @db.VarChar(60)
+  folhas    ChecklistLista[]
+  createdAt DateTime         @default(now())
+
+  @@map("operacional_departamentos")
+}
+
+/// Uma folha para imprimir e pendurar: um subdepartamento (Salão / Caixa) ou,
+/// com nome nulo, o próprio departamento (Delivery). É papel: nada se marca
+/// no sistema.
+model ChecklistLista {
+  id             Int                   @id @default(autoincrement())
+  departamentoId Int
+  departamento   ChecklistDepartamento @relation(fields: [departamentoId], references: [id], onDelete: Cascade)
+  /// O subdepartamento. Nulo = o departamento todo (no máximo uma por departamento).
+  nome           String?               @db.VarChar(60)
+  tarefas        ChecklistTarefa[]
+  createdAt      DateTime              @default(now())
+
+  @@unique([departamentoId, nome])
+  @@map("operacional_checklists")
+}
+
+/// Uma linha da folha, na abertura ou no fechamento.
+model ChecklistTarefa {
+  id      Int                @id @default(autoincrement())
+  listaId Int
+  lista   ChecklistLista     @relation(fields: [listaId], references: [id], onDelete: Cascade)
+  momento MomentoDoChecklist
+  texto   String             @db.VarChar(200)
+  ordem   Int                @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([listaId, momento])
+  @@map("operacional_checklist_tarefas")
+}
+
+/// O processo que quem tem a função precisa saber (e ser treinado nele).
+model ProcessoDaFuncao {
+  id         Int      @id @default(autoincrement())
+  funcaoId   Int
+  funcao     Funcao   @relation(fields: [funcaoId], references: [id], onDelete: Cascade)
+  processoId Int
+  processo   Processo @relation(fields: [processoId], references: [id], onDelete: Cascade)
+
+  @@unique([funcaoId, processoId])
+  @@index([processoId])
+  @@map("operacional_obrigatorios")
+}
+
+/// Alguém foi treinado num processo. Pode repetir (reciclagem): vale o mais recente.
+model Treinamento {
+  id              Int         @id @default(autoincrement())
+  colaboradorId   Int
+  colaborador     Colaborador @relation(fields: [colaboradorId], references: [id], onDelete: Cascade)
+  processoId      Int
+  processo        Processo    @relation(fields: [processoId], references: [id], onDelete: Cascade)
+  data            DateTime    @db.Date
+  instrutor       String?     @db.VarChar(80)
+  observacao      String?
+  registradoPorId Int?
+  registradoPor   AdminUser?  @relation("treinamentoRegistradoPor", fields: [registradoPorId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([colaboradorId, processoId])
+  @@index([processoId])
+  @@map("operacional_treinamentos")
+}
+
+// ---------------------------------------------------------------------------
+// Módulo Receituário — as fichas técnicas e operacionais, num lugar só
+// ---------------------------------------------------------------------------
+
+/// Receita pronta, ou pré-preparo, que entra como ingrediente de outras fichas.
+enum TipoFicha {
+  PRONTA
+  PRE_PREPARO
+}
+
+/// O que a cozinha usa nas receitas, com o preço por unidade de uso (g, mL
+/// ou un). O preço vem da última compra do produto ligado em Compras; sem
+/// compra (ou com o produto em caixa ou pacote, que não converte), vale o
+/// preço digitado aqui.
+model InsumoReceita {
+  id            Int      @id @default(autoincrement())
+  /// O código da planilha da casa ("INS-001").
+  codigo        String   @unique @db.VarChar(20)
+  nome          String   @db.VarChar(120)
+  categoria     String?  @db.VarChar(60)
+  /// "g", "mL" ou "un": a unidade em que a ficha escreve a quantidade.
+  unidadeUso    String   @db.VarChar(5)
+  produtoId     Int?
+  produto       Product? @relation(fields: [produtoId], references: [id], onDelete: SetNull)
+  /// O preço digitado: R$ por unidade de compra, e quanto (na unidade de uso) vem nela.
+  unidadeCompra String?  @db.VarChar(20)
+  precoCompra   Decimal? @db.Decimal(12, 4)
+  qtdPorUnidade Decimal  @default(1) @db.Decimal(12, 4)
+  /// Fator de correção: a fração do bruto que sobra útil (cebola 0,85).
+  rendimento    Decimal  @default(1) @db.Decimal(5, 4)
+  /// Preço estimado de mercado, ainda não conferido por nota.
+  estimado      Boolean  @default(false)
+  /// Pote, tampa, caixa, sacola: entra no custo da encomenda e do delivery, nunca no do buffet.
+  embalagem     Boolean  @default(false)
+  observacao    String?
+  ativo         Boolean  @default(true)
+
+  ingredientes  IngredienteDaFicha[]
+  extrasDeVenda ExtraDaVenda[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([produtoId])
+  @@map("receituario_insumos")
+}
+
+/// Uma receita da casa: a parte técnica (ingredientes, rendimento, custo) e
+/// a operacional (modo de preparo, forno, utensílios, ponto de controle,
+/// armazenamento e montagem), numa ficha só.
+model FichaTecnica {
+  id        Int       @id @default(autoincrement())
+  /// "264C": o número e a letra da categoria, como na pasta da cozinha.
+  codigo    String    @unique @db.VarChar(20)
+  nome      String    @db.VarChar(120)
+  categoria String    @db.VarChar(40)
+  tipo      TipoFicha @default(PRONTA)
+  /// Onde a receita é usada: BUFFET, DELIVERY, EVENTOS, CONGELADOS, ENCOMENDA.
+  operacoes String[]  @default([])
+  /// Como é feita: Assado, Cozido, Grelhado, Outros. A lista sai das configurações do módulo.
+  etiquetas String[]  @default([])
+
+  porcoes           Int      @default(1)
+  /// O peso (ou volume) pronto, na unidade do rendimento.
+  rendimentoTotal   Decimal? @db.Decimal(12, 2)
+  unidadeRendimento String   @default("g") @db.VarChar(5)
+  tempoPreparo      String?  @db.VarChar(40)
+
+  /// O modo de preparo, um passo por item.
+  passos      String[] @default([])
+  observacoes String?
+  alergenicos String[] @default([])
+
+  // A parte operacional.
+  viabilidade     String? @db.VarChar(40)
+  modoForno       String? @db.VarChar(60)
+  temperatura     String? @db.VarChar(30)
+  umidade         String? @db.VarChar(30)
+  tempoForno      String? @db.VarChar(40)
+  sonda           String? @db.VarChar(20)
+  ajusteForno     String?
+  utensilios      String?
+  pontoDeControle String?
+  /// Validade e como guardar ("2 dias a 4 °C; não recongelar").
+  armazenamento   String?
+  montagem        String?
+
+  /// Para a receita sem ingredientes lançados (as que vieram de Eventos): o
+  /// custo por porção digitado. Com ingredientes, vale a conta deles.
+  custoManualPorcao Decimal? @db.Decimal(12, 4)
+
+  /// Produzida, pesada e validada na cozinha.
+  conferida Boolean @default(false)
+  ativo     Boolean @default(true)
+
+  ingredientes    IngredienteDaFicha[] @relation("IngredientesDaFicha")
+  foto            FotoDaFicha?
+  /// As fichas que chamam esta como pré-preparo.
+  usadaEm         IngredienteDaFicha[] @relation("SubFicha")
+  itensDeCardapio CardapioItem[]
+  /// Como a receita é vendida fora do buffet: encomenda e delivery.
+  vendas          VendaDaFicha[]
+  /// As vendas que usam esta ficha como extra (a guarnição).
+  extraEm         ExtraDaVenda[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([categoria])
+  @@map("receituario_fichas")
+}
+
+/// Por onde a receita é vendida fora do buffet.
+enum CanalDeVenda {
+  /// Sob encomenda: o cliente pede e retira (maionese, frango, feijão).
+  ENCOMENDA
+  DELIVERY
+  /// Prato montado no salão. Ainda sem uso: a casa começa pela encomenda.
+  ALACARTE
+}
+
+/// Como o item é cobrado.
+enum UnidadeDeVenda {
+  KG
+  UN
+  POTE
+}
+
+/// Um item da lista de preços: quanto da receita pronta vai em cada unidade
+/// vendida, o preço e os extras (embalagem, guarnição). O custo não é
+/// guardado: sai da ficha, que sai da última compra dos insumos.
+model VendaDaFicha {
+  id           Int            @id @default(autoincrement())
+  fichaId      Int
+  ficha        FichaTecnica   @relation(fields: [fichaId], references: [id], onDelete: Cascade)
+  canal        CanalDeVenda
+  /// Como aparece na lista de preços: "Maionese 500 g", "Frango assado inteiro".
+  nome         String         @db.VarChar(120)
+  unidadeVenda UnidadeDeVenda
+  /// Quanto da receita pronta vai em cada unidade vendida, na unidade do
+  /// rendimento da ficha: 1000 (g) no kg, 500 (g) no pote, 1 (un) no frango.
+  quantidade   Decimal        @db.Decimal(12, 3)
+  precoVenda   Decimal?       @db.Decimal(12, 2)
+  ativo        Boolean        @default(true)
+  /// O delivery que parte de uma encomenda: custa o que ela custa mais os extras dele.
+  baseId       Int?
+  base         VendaDaFicha?  @relation("BaseDaVenda", fields: [baseId], references: [id], onDelete: SetNull)
+  derivadas    VendaDaFicha[] @relation("BaseDaVenda")
+  extras       ExtraDaVenda[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([fichaId])
+  @@map("receituario_vendas")
+}
+
+/// O que entra além da receita: um insumo (o pote, a sacola) ou outra ficha (a guarnição).
+model ExtraDaVenda {
+  id         Int            @id @default(autoincrement())
+  vendaId    Int
+  venda      VendaDaFicha   @relation(fields: [vendaId], references: [id], onDelete: Cascade)
+  ordem      Int            @default(0)
+  insumoId   Int?
+  insumo     InsumoReceita? @relation(fields: [insumoId], references: [id], onDelete: Restrict)
+  subFichaId Int?
+  subFicha   FichaTecnica?  @relation(fields: [subFichaId], references: [id], onDelete: Restrict)
+  /// Na unidade de uso do insumo (1 un de pote) ou do rendimento da ficha (80 g de farofa).
+  quantidade Decimal        @db.Decimal(12, 3)
+
+  @@index([vendaId])
+  @@index([insumoId])
+  @@index([subFichaId])
+  @@map("receituario_vendas_extras")
+}
+
+/// A foto do prato pronto. Mora à parte para as listas não carregarem os bytes.
+model FotoDaFicha {
+  fichaId   Int          @id
+  ficha     FichaTecnica @relation(fields: [fichaId], references: [id], onDelete: Cascade)
+  mime      String       @db.VarChar(80)
+  tamanho   Int
+  dados     Bytes
+  /// 240 px em JPEG, para a lista das fichas.
+  miniatura Bytes?
+  updatedAt DateTime     @updatedAt
+
+  @@map("receituario_fotos")
+}
+
+/// Uma linha de ingrediente: um insumo, um pré-preparo (outra ficha) ou um
+/// nome livre sem preço (a água).
+model IngredienteDaFicha {
+  id         Int            @id @default(autoincrement())
+  fichaId    Int
+  ficha      FichaTecnica   @relation("IngredientesDaFicha", fields: [fichaId], references: [id], onDelete: Cascade)
+  ordem      Int            @default(0)
+  insumoId   Int?
+  insumo     InsumoReceita? @relation(fields: [insumoId], references: [id], onDelete: Restrict)
+  subFichaId Int?
+  subFicha   FichaTecnica?  @relation("SubFicha", fields: [subFichaId], references: [id], onDelete: Restrict)
+  nomeLivre  String?        @db.VarChar(120)
+  quantidade Decimal        @db.Decimal(12, 3)
+  /// "g", "mL" ou "un"; nulo quando a planilha não disse (a água).
+  unidade    String?        @db.VarChar(5)
+  /// Como o item entra: "higienizado e cortado", "pesado na balança".
+  preparo    String?        @db.VarChar(160)
+
+  @@index([fichaId])
+  @@index([insumoId])
+  @@index([subFichaId])
+  @@map("receituario_ingredientes")
+}
+
+/// A meta de food cost e o markup que dão o preço sugerido. Uma linha só.
+model ConfigReceituario {
+  id                 Int      @id @default(1)
+  metaFoodCost       Decimal  @default(0.30) @db.Decimal(5, 4)
+  markup             Decimal  @default(3) @db.Decimal(6, 3)
+  /// As etiquetas que se escolhem na ficha, na ordem em que aparecem.
+  etiquetas          String[] @default(["Assado", "Cozido", "Grelhado", "Outros"])
+  /// A cor escolhida para cada categoria, { "Salada": "verde" }; só o que difere do padrão.
+  coresDasCategorias Json     @default("{}")
+
+  @@map("receituario_config")
+}

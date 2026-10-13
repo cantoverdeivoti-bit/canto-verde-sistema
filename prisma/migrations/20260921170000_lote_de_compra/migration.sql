@@ -1,0 +1,23 @@
+-- De quanto em quanto a casa compra cada item.
+--
+-- A água vem em fardo de 12. A sugestão pedia 13, e 13 não é uma compra que
+-- exista: ou são 12, ou são 24. O fornecedor recebia uma linha que ninguém
+-- consegue entregar, e quem compra corrigia de cabeça, item por item, toda
+-- semana.
+--
+-- Nulo e sem default, que é a resposta certa para quase todos: são 341
+-- produtos ativos e só os que vêm em fardo ou caixa têm lote. Nulo quer dizer
+-- "sem lote, qualquer número serve", e por isso as linhas que já existem
+-- continuam exatamente como estão — a sugestão delas não muda em nada.
+--
+-- Decimal(10,3) como minStock e idealStock: tempero em pote de 0,5 kg é lote
+-- tanto quanto fardo de 12.
+--
+-- Sem CHECK de maior que zero. Nenhuma migração deste projeto usa CHECK, e a
+-- guarda contra divisão por zero mora onde ela pode dar mensagem a quem
+-- digitou: o schema Zod do produto.
+--
+-- NÃO confundir com "precos"."embalagem" e "precos"."conteudo": aquilo é como
+-- o FORNECEDOR vende, por rodada de cotação; isto é como a CASA compra, e é
+-- cadastro.
+ALTER TABLE "products" ADD COLUMN "lotSize" DECIMAL(10,3);

@@ -1,0 +1,306 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-31T00:00:00.000Z",
+  "title": "Design System: Canto Verde",
+  "extensions": {
+    "colorMeta": {
+      "vinho": {
+        "role": "primary",
+        "displayName": "Vinho",
+        "canonical": "#2f4a2b",
+        "tonalRamp": [
+          "#360000",
+          "#5b0114",
+          "#812b32",
+          "#a94f52",
+          "#d17275",
+          "#f79496",
+          "#ffb4b5",
+          "#ffcece"
+        ]
+      },
+      "dourado": {
+        "role": "secondary",
+        "displayName": "Dourado (marca)",
+        "canonical": "#eab142",
+        "tonalRamp": [
+          "#2e0000",
+          "#501e00",
+          "#734000",
+          "#986300",
+          "#be8700",
+          "#e2a939",
+          "#ffca5e",
+          "#ffe479"
+        ]
+      },
+      "ocre": {
+        "role": "secondary",
+        "displayName": "Ocre",
+        "canonical": "#8a6410",
+        "tonalRamp": [
+          "#270500",
+          "#472500",
+          "#6a4500",
+          "#8d6715",
+          "#b38b41",
+          "#d6ad64",
+          "#f7cd83",
+          "#ffe89d"
+        ]
+      },
+      "preto": {
+        "role": "neutral",
+        "displayName": "Preto",
+        "canonical": "#0e1217",
+        "tonalRamp": [
+          "#0e1217",
+          "#2a2e34",
+          "#494e54",
+          "#6a6f76",
+          "#8d939a",
+          "#afb5bc",
+          "#cfd5dc",
+          "#e9eff7"
+        ]
+      },
+      "branco": {
+        "role": "neutral",
+        "displayName": "Branco",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#121212",
+          "#2e2e2e",
+          "#4d4d4d",
+          "#6f6f6f",
+          "#929292",
+          "#b4b4b4",
+          "#d4d4d4",
+          "#eeeeee"
+        ]
+      },
+      "superficie": {
+        "role": "neutral",
+        "displayName": "Superfície",
+        "canonical": "#faf8f5",
+        "tonalRamp": [
+          "#13110f",
+          "#2f2e2b",
+          "#4e4d4a",
+          "#706e6c",
+          "#94928f",
+          "#b6b4b1",
+          "#d6d4d1",
+          "#f0eeeb"
+        ]
+      },
+      "linha": {
+        "role": "neutral",
+        "displayName": "Linha",
+        "canonical": "#e4ded7",
+        "tonalRamp": [
+          "#15110c",
+          "#322d28",
+          "#514c46",
+          "#736e68",
+          "#97918b",
+          "#b9b3ac",
+          "#d9d3cc",
+          "#f3ede6"
+        ]
+      },
+      "texto-apoio": {
+        "role": "neutral",
+        "displayName": "Texto de apoio",
+        "canonical": "#5f5a58",
+        "tonalRamp": [
+          "#14110f",
+          "#312d2b",
+          "#514c4a",
+          "#736d6b",
+          "#96918f",
+          "#b8b3b1",
+          "#d9d3d0",
+          "#f3edeb"
+        ]
+      },
+      "alarme": {
+        "role": "tertiary",
+        "displayName": "Alarme",
+        "canonical": "#a8202f",
+        "tonalRamp": [
+          "#430000",
+          "#6b0000",
+          "#94001f",
+          "#bd3740",
+          "#e85f62",
+          "#ff8283",
+          "#ffa3a2",
+          "#ffbdbc"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "A frase da reserva e títulos da página pública. Archivo esticado a wdth 118, peso 640."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Título de tela no painel."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Rótulo de seção e sobrelinha, caixa alta curta."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Texto corrido e campos de formulário."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Só número que importa: horário, lugares, telefone, contagens. É raro de propósito."
+      }
+    },
+    "shadows": [
+      {
+        "name": "sublinhado-ativo",
+        "value": "inset 0 -0.14em 0 color-mix(in srgb, var(--accent) 35%, transparent)",
+        "purpose": "Traço que marca item de navegação ativo e slot preenchido da frase. É desenho, não elevação."
+      },
+      {
+        "name": "anel-hoje",
+        "value": "inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent)",
+        "purpose": "Contorno do dia de hoje no calendário."
+      }
+    ],
+    "motion": [
+      {
+        "name": "transition-padrao",
+        "value": "150ms cubic-bezier(0.4, 0, 0.2, 1)",
+        "purpose": "Única transição do sistema, em hover e foco. prefers-reduced-motion é respeitado globalmente."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Botão primário",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Ação principal da tela. Texto na cor superfície, nunca branco cravado.",
+      "html": "<button class=\"ds-btn-primary\">Reservar a mesa</button>",
+      "css": ".ds-btn-primary{display:inline-flex;align-items:center;justify-content:center;background:var(--accent,#2f4a2b);color:var(--surface,#faf8f5);border:none;border-radius:8px;padding:14px 20px;font:600 15px/1.5 Archivo,system-ui,sans-serif;cursor:pointer;transition:opacity .15s}.ds-btn-primary:hover{opacity:.9}.ds-btn-primary:focus-visible{outline:2px solid var(--ring,#8a6410);outline-offset:2px}"
+    },
+    {
+      "name": "Botão fantasma",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Ação secundária de linha: borda que acende no hover.",
+      "html": "<button class=\"ds-btn-ghost\">Buscar</button>",
+      "css": ".ds-btn-ghost{display:inline-flex;align-items:center;justify-content:center;background:var(--surface,#faf8f5);color:var(--foreground,#0e1217);border:1px solid var(--border,#e4ded7);border-radius:8px;padding:6px 12px;font:500 14px/1.5 Archivo,system-ui,sans-serif;cursor:pointer;transition:border-color .15s}.ds-btn-ghost:hover{border-color:var(--accent,#2f4a2b)}.ds-btn-ghost:focus-visible{outline:2px solid var(--ring,#8a6410);outline-offset:2px}"
+    },
+    {
+      "name": "Campo de texto",
+      "kind": "input",
+      "refersTo": "field",
+      "description": "Entrada padrão. O foco troca a borda para vinho e abre um anel suave.",
+      "html": "<input class=\"ds-field\" placeholder=\"Nome ou telefone\" />",
+      "css": ".ds-field{width:100%;background:var(--surface,#faf8f5);color:var(--foreground,#0e1217);border:1px solid var(--border,#e4ded7);border-radius:8px;padding:10px 12px;font:400 15px/1.5 Archivo,system-ui,sans-serif;outline:none;transition:border-color .15s,box-shadow .15s}.ds-field::placeholder{color:var(--muted,#5f5a58)}.ds-field:focus{border-color:var(--accent,#2f4a2b);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent,#2f4a2b) 25%,transparent)}"
+    },
+    {
+      "name": "Ficha de escolha",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "Escolha de horário ou de número de pessoas. Selecionada preenche em vinho — e sempre acompanha aria-pressed, porque cor nunca anda sozinha.",
+      "html": "<button class=\"ds-chip\" aria-pressed=\"false\">19:30</button> <button class=\"ds-chip\" aria-pressed=\"true\">11:30</button>",
+      "css": ".ds-chip{background:var(--surface,#faf8f5);color:var(--foreground,#0e1217);border:1px solid var(--border,#e4ded7);border-radius:8px;padding:10px 14px;font:500 15px/1.5 Archivo,system-ui,sans-serif;font-variant-numeric:tabular-nums;cursor:pointer;transition:border-color .15s}.ds-chip:hover{border-color:var(--accent,#2f4a2b)}.ds-chip[aria-pressed=\"true\"]{background:var(--accent,#2f4a2b);border-color:var(--accent,#2f4a2b);color:var(--surface,#faf8f5)}.ds-chip:focus-visible{outline:2px solid var(--ring,#8a6410);outline-offset:2px}"
+    },
+    {
+      "name": "Dia do calendário",
+      "kind": "custom",
+      "refersTo": "cal-day",
+      "description": "O dia reservável carrega um ponto abaixo do número — forma, não só cor. Fechado é riscado e não clica.",
+      "html": "<button class=\"ds-cal-day\" data-open>10</button> <button class=\"ds-cal-day\" data-state=\"closed\" disabled>7</button>",
+      "css": ".ds-cal-day{position:relative;display:inline-flex;align-items:center;justify-content:center;height:44px;width:44px;border:none;background:none;color:var(--foreground,#0e1217);border-radius:8px;font:400 15px/1 Archivo,system-ui,sans-serif;font-variant-numeric:tabular-nums;cursor:pointer;transition:background .15s}.ds-cal-day:hover{background:var(--accent-soft,#edf2ea)}.ds-cal-day[data-open]::after{content:\"\";position:absolute;bottom:6px;left:50%;height:5px;width:5px;transform:translateX(-50%);border-radius:9999px;background:var(--accent,#2f4a2b)}.ds-cal-day[data-state=\"closed\"]{text-decoration:line-through;color:var(--muted,#5f5a58);opacity:.45;pointer-events:none}"
+    },
+    {
+      "name": "Link de navegação",
+      "kind": "nav",
+      "refersTo": "nav-link",
+      "description": "O item ativo ganha fundo suave e o sublinhado interno — a assinatura do sistema.",
+      "html": "<a class=\"ds-nav-link\" href=\"#\">Agenda</a> <a class=\"ds-nav-link\" href=\"#\" aria-current=\"page\">Clientes</a>",
+      "css": ".ds-nav-link{display:inline-block;border-radius:6px;padding:2px 6px;color:var(--muted,#5f5a58);font:400 14px/1.5 Archivo,system-ui,sans-serif;text-decoration:none;transition:color .15s}.ds-nav-link:hover{color:var(--foreground,#0e1217)}.ds-nav-link[aria-current]{font-weight:600;color:var(--accent,#2f4a2b);background:color-mix(in srgb,var(--accent,#2f4a2b) 9%,transparent);box-shadow:inset 0 -.14em 0 color-mix(in srgb,var(--accent,#2f4a2b) 35%,transparent)}"
+    },
+    {
+      "name": "Mensagem de atenção",
+      "kind": "custom",
+      "refersTo": "msg-warn",
+      "description": "Aviso da casa e pendências. Fundo derivado do dourado, texto na cor do documento — o dourado nunca vira texto no claro.",
+      "html": "<div class=\"ds-msg-warn\">Guardamos a mesa por 15 minutos depois do horário.</div>",
+      "css": ".ds-msg-warn{border-radius:4px;padding:12px 16px;color:var(--foreground,#0e1217);background:color-mix(in srgb,var(--warn,#8a6410) 14%,var(--surface,#faf8f5));font:400 14px/1.5 Archivo,system-ui,sans-serif}"
+    }
+  ],
+  "narrative": {
+    "northStar": "O Letreiro Esmaltado",
+    "overview": "A casa tem quatro cores e elas vêm de fachada: verde-mata, trigo, branco e terra. O sistema se comporta como sinalização — pouca coisa por tela, grande, legível de relance por quem está com pressa. O dono lê a agenda andando pelo salão; o cliente reserva no ônibus. Nenhum dos dois tem tempo de decifrar.\n\nA tipografia é uma família só, esticada. O Archivo tem eixo de largura até 125, então o display não é outra fonte: é a mesma letra da interface aberta até virar placa. Isso mantém a tela coesa e evita a serifada de vitrine que não pertence a uma casa de almoço. Os números — horário, lugares, telefone — saem em mono, alinham em coluna sem tabela e leem como comanda, que é de onde vieram.\n\nA superfície é plana. Não há sombra em lugar nenhum: profundidade vem de linha fina e de troca de fundo, nunca de elevação simulada. A única exceção é um sublinhado interno que marca o que está ativo, e ele é traço, não sombra.",
+    "keyCharacteristics": [
+      "Quatro cores, cada uma com um papel; nada mais tem cor",
+      "Uma família de texto esticada no eixo de largura, mais um mono só para números",
+      "Superfície plana: linha e fundo, nunca sombra",
+      "Um ponto de identidade forte por tela; o resto em silêncio",
+      "Contraste medido, não estimado: todo par de texto passa AA"
+    ],
+    "rules": [
+      {
+        "name": "A Regra do Dourado",
+        "body": "O dourado da marca não vira cor de interface. Sobre branco ele dá 1.93:1. Onde a tela precisa do papel dele — pendência, atraso — quem entra é o ocre #8a6410.",
+        "section": "colors"
+      },
+      {
+        "name": "A Regra dos Quatro Papéis",
+        "body": "Vinho = escolhido. Dourado/ocre = pendente. Alarme = destrutivo. Preto = texto. Uma cor fora desses quatro papéis é um erro, não uma variação.",
+        "section": "colors"
+      },
+      {
+        "name": "A Regra do Mono",
+        "body": "O mono aparece só em número que importa. É por ser raro que ele significa 'isto é um dado, não uma palavra'. Usá-lo em texto corrido apaga o sinal.",
+        "section": "typography"
+      },
+      {
+        "name": "A Regra dos Dois-Pontos",
+        "body": "Em corpo grande o mono dá avanço inteiro ao \":\" e o horário lê \"11 : 30\". Feche com margem negativa no próprio caractere, não com tracking na linha toda.",
+        "section": "typography"
+      },
+      {
+        "name": "A Regra da Superfície Plana",
+        "body": "Sombra não é usada para hierarquia. Se um elemento precisa se destacar, ele muda de fundo, ganha linha ou muda de peso — nunca levanta.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do usar var(--surface) como texto de botão preenchido, nunca white cravado.",
+      "Do medir o contraste antes de escolher um tom novo. Todo par de texto neste sistema passa AA e os números estão anotados no CSS.",
+      "Do derivar número da configuração ou dos dados. Um valor escrito à mão vira mentira no dia em que o modelo muda.",
+      "Do dar forma além da cor a qualquer estado: ponto, preenchimento, risco, aria-pressed.",
+      "Do dar margem negativa aos dois-pontos do mono em corpo grande, em vez de apertar a linha inteira abaixo do piso de -0.04em."
+    ],
+    "donts": [
+      "Don't usar o dourado da marca como cor de interface. 1.93:1 sobre branco.",
+      "Don't adicionar box-shadow de elevação. Este sistema é plano.",
+      "Don't introduzir uma quinta cor. Se um estado novo precisa de cor, ele precisa primeiro de um dos quatro papéis existentes.",
+      "Don't trazer serifada de display. A ênfase vem da largura do Archivo, não de outra família.",
+      "Don't usar mono em texto corrido — ele significa 'número' por ser raro.",
+      "Don't escrever plural entre parênteses: 3 reserva(s). A tela sabe o número, então sabe a palavra; use o utilitário plural()."
+    ]
+  }
+}

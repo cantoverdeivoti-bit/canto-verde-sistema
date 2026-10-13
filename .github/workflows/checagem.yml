@@ -1,0 +1,88 @@
+# A checagem que roda sozinha em toda PR para o master (e em todo push nele).
+#
+# Por que existe: os testes e o build só rodavam quando alguém lembrava de
+# rodar, e uma publicação quebrada só aparecia depois do merge, na Vercel.
+# Aqui roda o mesmo que se roda antes de publicar: tipos, lint, as regras
+# testadas sem banco e o build. As migrations são aplicadas num Postgres vazio
+# do próprio GitHub, o que pega uma migration quebrada antes da produção.
+#
+# Para barrar o merge com a checagem vermelha: GitHub → Settings → Branches →
+# regra do master → "Require status checks to pass" → "checagem".
+
+name: checagem
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+concurrency:
+  group: checagem-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checagem:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://ci:ci@localhost:5432/ci?sslmode=disable
+      DIRECT_URL: postgres://ci:ci@localhost:5432/ci?sslmode=disable
+      AUTH_SECRET: segredo-so-da-checagem-nao-e-usado-em-lugar-nenhum
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # O postinstall já roda o `prisma generate`.
+      - name: Instalar
+        run: npm ci
+
+      # PageProps, LayoutProps e RouteContext são gerados pelo Next dentro de
+      # .next/, que um clone novo não tem; sem isso o tsc acusa 73 erros.
+      - name: Tipos das rotas
+        run: npx next typegen
+
+      - name: Tipos
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Migrations num banco vazio
+        run: npx prisma migrate deploy
+
+      # As configurações iniciais: sem elas o build avisa "Configuração ausente".
+      - name: Seed
+        run: npx prisma db seed
+        env:
+          ADMIN_USERNAME: ci
+          ADMIN_INITIAL_PASSWORD: senha-so-da-checagem-123
+
+      - name: Regras
+        run: npm run test:regras
+
+      # Sem VERCEL_ENV, o build pula a etapa que migra a produção.
+      - name: Build
+        run: npm run build

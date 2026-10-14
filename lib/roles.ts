@@ -106,6 +106,10 @@ export function can(
   options?: OpcoesDaTrava,
 ): boolean {
   if (!user) return false;
+  // Módulo desligado não abre para ninguém, nem para o superusuário: assim
+  // os atalhos, a Programação e os números da home que dependem dele somem
+  // juntos, sem cada tela precisar lembrar.
+  if (MODULES.find((m) => m.slug === moduleSlug)?.enabled === false) return false;
   // Pelo link de atalhos, fechado por padrão: o que não pediu para abrir
   // continua fechado, inclusive o que for criado depois.
   if (user.atalho && !options?.atalho) return false;

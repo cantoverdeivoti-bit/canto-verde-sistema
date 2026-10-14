@@ -154,7 +154,7 @@ export default async function EcosystemHome() {
   // Módulo pronto e sem permissão some: mostrá-lo contaria que existe
   // trabalho ali dentro. Os desligados ficam numa linha só, no pé.
   const prontos = MODULES.filter((m) => m.enabled && can(user, m.slug));
-  const emPreparacao = MODULES.filter((m) => !m.enabled);
+  const emPreparacao = MODULES.filter((m) => !m.enabled && !m.oculto);
 
   return (
     <>

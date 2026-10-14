@@ -316,7 +316,7 @@ export function UsersList({
             <span className="text-center">Configura</span>
           </div>
           <ul className="divide-y divide-[var(--border)]">
-            {MODULES.map((m) => {
+            {MODULES.filter((m) => !m.oculto).map((m) => {
               const acesso = temAcesso(m.slug);
               return (
                 <li key={m.slug} className="grid grid-cols-[1fr_5rem_5rem] items-center px-3 py-1.5">

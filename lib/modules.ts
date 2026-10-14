@@ -112,6 +112,9 @@ export type EcosystemModule = {
       a trava vale ao mesmo tempo para a navegação, para o layout e para as
       ações: não há um caminho que esqueça de perguntar. */
   soSuperusuario?: boolean;
+  /** Desligado de vez nesta casa: some da home, da lateral e da tela de
+      Usuários, em vez de aparecer como "em preparação". */
+  oculto?: true;
   icone: NomeDoIcone;
   sections: ModuleSection[];
 };
@@ -121,7 +124,10 @@ export const MODULES: EcosystemModule[] = [
     slug: "comercial",
     name: "Reservas",
     description: "Quem vem hoje, quem já veio, e as regras da casa.",
-    enabled: true,
+    // Desligado no Canto Verde: as reservas continuam no sistema próprio da
+    // casa (cantoverdereservas). O código fica, para religar se um dia mudar.
+    enabled: false,
+    oculto: true,
     icone: "agenda",
     // A agenda mora na raiz do módulo, não numa subrota. É a tela que o dono
     // abre dezenas de vezes por serviço, e um clique a mais todo dia é caro.

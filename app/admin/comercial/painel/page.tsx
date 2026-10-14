@@ -1,7 +1,6 @@
 import { ExternalLink } from "lucide-react";
 
 import { CabecalhoDaPagina, Pagina } from "@/components/pagina";
-import { buttonVariants } from "@/components/ui/button";
 import { guardModule } from "@/lib/auth-guard";
 import { prisma } from "@/lib/db";
 import { can } from "@/lib/roles";
@@ -34,24 +33,21 @@ export default async function PainelDeReservasPage() {
     );
   }
 
+  // O Google não deixa o painel abrir dentro de outra página enquanto o
+  // script não liberar (setXFrameOptionsMode ALLOWALL no doGet). Até lá,
+  // a tela é um botão grande que abre o painel direto.
   return (
-    <div className="space-y-3">
-      <CabecalhoDaPagina
-        titulo="Painel de reservas"
-        subtitulo="Sábados, domingos e feriados, direto da planilha."
-        acoes={
-          <a href={url} target="_blank" rel="noopener noreferrer" className={buttonVariants({ variant: "outline", size: "sm" })}>
-            <ExternalLink aria-hidden className="size-4" />
-            Abrir em tela cheia
-          </a>
-        }
-      />
-      <iframe
-        src={url}
-        title="Painel de reservas do Canto Verde"
-        className="h-[calc(100dvh-11rem)] min-h-[600px] w-full rounded-lg border bg-white"
-        allow="clipboard-write"
-      />
+    <Pagina>
+      <CabecalhoDaPagina titulo="Painel de reservas" subtitulo="Sábados, domingos e feriados, direto da planilha." />
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="flex items-center justify-center gap-2 rounded-xl bg-[var(--botao)] px-6 py-8 text-lg font-semibold text-[var(--botao-texto)] hover:opacity-90"
+      >
+        <ExternalLink aria-hidden className="size-5" />
+        Abrir o painel de reservas
+      </a>
       {podeConfigurar && (
         <details className="text-sm">
           <summary className="cursor-pointer text-[var(--muted-foreground)]">Trocar o link do painel</summary>
@@ -60,6 +56,6 @@ export default async function PainelDeReservasPage() {
           </div>
         </details>
       )}
-    </div>
+    </Pagina>
   );
 }

@@ -78,6 +78,11 @@ model ReservationRules {
   sobreACasa String? @db.VarChar(200)
   fotoUrl    String? @db.VarChar(500)
 
+  /// O painel de reservas do Canto Verde (app do Google ligado à planilha),
+  /// aberto dentro do admin. Fica no banco e não no código: o link leva a
+  /// chave de acesso do painel, e o repositório é público.
+  painelReservasUrl String? @db.VarChar(500)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

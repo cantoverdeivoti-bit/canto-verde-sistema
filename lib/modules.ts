@@ -129,6 +129,7 @@ export const MODULES: EcosystemModule[] = [
     // "Reservas do dia", e não "Agenda": a Agenda é a de toda a casa, no
     // menu principal, junto do Painel central.
     sections: [
+      { href: "/admin/comercial/painel", label: "Painel de reservas", icone: "painel" },
       { href: "/admin/comercial", label: "Reservas do dia", icone: "agenda" },
       { href: "/admin/comercial/crm", label: "CRM", icone: "pessoas" },
       { href: "/admin/comercial/configuracoes", label: "Configurações", icone: "ajustes" },

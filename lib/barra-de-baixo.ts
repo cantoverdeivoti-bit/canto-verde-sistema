@@ -45,7 +45,7 @@ const TELAS: AtalhoDaBarra[] = [
     href: "/admin/agenda",
     modulos: ["comercial", "compras", "pessoal", "eventos", "tarefas", "financeiro"],
   },
-  { chave: "reservas", nome: "Reservas", completo: "Reservas do dia", icone: "agenda", href: "/admin/comercial", modulos: ["comercial"], exato: true },
+  { chave: "reservas", nome: "Reservas", completo: "Painel de reservas", icone: "agenda", href: "/admin/comercial/painel", modulos: ["comercial"], exato: true },
   {
     chave: "pendencias",
     nome: "Pendências",

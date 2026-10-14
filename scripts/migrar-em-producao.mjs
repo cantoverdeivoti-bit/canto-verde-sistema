@@ -30,5 +30,19 @@ console.log("migrations: aplicando as pendentes no banco de produção");
 const r = spawnSync("npx", ["prisma", "migrate", "deploy"], { stdio: "inherit" });
 if (r.status !== 0) {
   console.error("migrations: FALHOU. O build para aqui, e o site continua na versão anterior.");
+  process.exit(r.status ?? 1);
 }
-process.exit(r.status ?? 1);
+
+// Primeira publicação do Canto Verde: com ADMIN_INITIAL_PASSWORD na Vercel, o
+// seed cria a casa (regras, lotação, horários) e o usuário admin. Ele só
+// insere o que falta (upsert sem update), então rodar de novo não muda nada.
+// Depois do primeiro acesso, a variável pode sair da Vercel.
+if (process.env.ADMIN_INITIAL_PASSWORD) {
+  console.log("seed: criando a configuração inicial e o admin, se faltarem");
+  const s = spawnSync("npx", ["tsx", "prisma/seed.ts"], { stdio: "inherit" });
+  if (s.status !== 0) {
+    console.error("seed: FALHOU. O build para aqui.");
+    process.exit(s.status ?? 1);
+  }
+}
+process.exit(0);
